@@ -90,7 +90,7 @@ if command -v /usr/sbin/i2cdetect >/dev/null 2>&1 && command -v /usr/sbin/i2ctra
 
     if [ -z "$TOUCHPAD_WITH_DIALPAD_DETECTED" ]; then
         echo "The detection was not successful. Touchpad with DialPad not found. Check whether your touchpad has integrated DialPad (e.g. on product websites) and in case it has then create an issue here https://github.com/sinu0/asus-turnpad/issues (see PORTING.md)."
-        echo "A touchpad without a DialPad works too: after the install switch on Driver > Emulate the DialPad in the Turnpad settings app."
+        echo "A touchpad without a DialPad works too: after the install switch on Driver > Touchpad mode in the Turnpad settings app."
 
         # Unattended installs continue: the touchpad may still work once
         # calibrated, and the driver picks the I2C address itself.

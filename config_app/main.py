@@ -34,6 +34,7 @@ from config.labels import (
     parse_keys,
     segment_icon,
     GROUP_ICON,
+    KNOWN_KEYS,
 )
 from config.presets import (
     FUNCTION_LIBRARY,
@@ -59,6 +60,7 @@ from config.schema import (
     _encoder,
     darktable_colour_labels_segment,
     load_config,
+    normalize_key_name,
     save_config,
     shell_commands,
 )
@@ -3554,7 +3556,7 @@ class Application(Adw.Application):
 
     def _start_calibration(self):
         if self.config.emulation.enabled:
-            self._calibration_row.set_title("Not needed for the emulated dial")
+            self._calibration_row.set_title("Not needed in Touchpad mode")
             self._calibration_row.set_subtitle("It uses the whole touchpad; its centre size is on the Driver page")
             return
 
@@ -3725,7 +3727,7 @@ class Application(Adw.Application):
             ("profile", "Active profile"),
             ("function", "Selected function"),
             ("environment", "Environment"),
-            ("touchpad", "Touchpad"),
+            ("touchpad", "Mode"),
             ("configuration", "Configuration"),
         ):
             row = Adw.ActionRow(title=title, subtitle="Unknown")
@@ -3737,6 +3739,7 @@ class Application(Adw.Application):
         status.set_header_suffix(refresh)
         content.append(status)
         content.append(self._emulation_group())
+        content.append(self._mouse_group())
 
         tools = Adw.PreferencesGroup(title="Tools")
         reload_row = Adw.ActionRow(title="Reload configuration", subtitle="The driver normally reloads after every change")
@@ -3761,7 +3764,7 @@ class Application(Adw.Application):
         """Emulated dial for touchpads without a DialPad, and the toggle shortcut."""
         emulation = self.config.emulation
         group = Adw.PreferencesGroup(
-            title="Touchpad",
+            title="Touchpad mode",
             description=(
                 "Without a DialPad (no printed dial, no light) the driver can emulate it: "
                 "while the dial is on, the whole touchpad is the dial and the pointer stands still."
@@ -3778,7 +3781,7 @@ class Application(Adw.Application):
                 self._restart_driver()
 
         group.add(_switch_row(
-            "Emulate the DialPad", "Restarts the driver; works on any touchpad",
+            "Touchpad mode", "Emulate the DialPad on any touchpad; restarts the driver",
             emulation.enabled, emulate_changed,
         ))
         options.append(_switch_row(
@@ -3810,6 +3813,98 @@ class Application(Adw.Application):
             lambda: self._spawn(["gnome-control-center", "keyboard"], "GNOME Settings is not available"),
         ))
         group.add(shortcut)
+        return group
+
+    def _mouse_group(self):
+        """A mouse as the dial for a computer without a touchpad."""
+        mouse = self.config.mouse
+        group = Adw.PreferencesGroup(
+            title="Mouse-only mode",
+            description=(
+                "Without a touchpad a mouse can be the dial: the wheel turns it, the middle button is its "
+                "centre, a left click selects and a right click goes back. While the dial is on, the "
+                "pointer stands still (the driver grabs the mouse)."
+            ),
+        )
+        options = []
+
+        def enabled_changed(active):
+            for row in options:
+                row.set_sensitive(active)
+            if mouse.enabled != active:
+                mouse.enabled = active
+                # The driver opens its devices at start.
+                self._restart_driver()
+
+        group.add(_switch_row(
+            "Mouse-only mode", "A mouse is the dial, no touchpad needed; restarts the driver",
+            mouse.enabled, enabled_changed,
+        ))
+
+        key_row = Adw.EntryRow(title="Toggle key, e.g. F13, KEY_3 or BTN_SIDE")
+        key_row.set_text(mouse.toggle_key)
+        key_row.set_show_apply_button(True)
+
+        def key_applied(row):
+            name = normalize_key_name(row.get_text(), "")
+            # Keys come from the evdev table; mouse buttons cannot be checked here.
+            if name not in KNOWN_KEYS and not name.startswith("BTN_"):
+                row.add_css_class("error")
+                self._toast(f"“{row.get_text().strip()}” is not a key name")
+                return
+            row.remove_css_class("error")
+            row.set_text(name)
+            if mouse.toggle_key != name:
+                mouse.toggle_key = name
+                self._restart_driver() if mouse.enabled else self._schedule_save()
+
+        key_row.connect("apply", key_applied)
+        options.append(key_row)
+
+        device_row = Adw.EntryRow(title="Mouse name (part of it; empty: automatic)")
+        device_row.set_text(mouse.device)
+        device_row.set_show_apply_button(True)
+
+        def device_applied(row):
+            name = row.get_text().strip()
+            if mouse.device != name:
+                mouse.device = name
+                self._restart_driver() if mouse.enabled else self._schedule_save()
+
+        device_row.connect("apply", device_applied)
+        options.append(device_row)
+
+        def apply_mouse_setting(attribute, value):
+            if getattr(mouse, attribute) != value:
+                setattr(mouse, attribute, value)
+                # Read when the driver starts.
+                self._restart_driver() if mouse.enabled else self._schedule_save()
+
+        options.append(_switch_row(
+            "Move the mouse around the dial",
+            "The direction you move the mouse is the dial's angle: move towards a tile, circle to turn. "
+            "The wheel keeps working",
+            mouse.motion, lambda active: apply_mouse_setting("motion", active),
+        ))
+        options.append(_spin_row(
+            "Size of the movement", "Mouse counts the hand travels before the dial follows; smaller is more sensitive",
+            mouse.motion_radius, 50, 2000, 50, 0,
+            lambda value: apply_mouse_setting("motion_radius", int(value)),
+        ))
+
+        tip = Adw.ActionRow(
+            title="Which key?",
+            subtitle=(
+                "The key must come from the mouse itself: map a side button to F13 with Piper (Logitech G "
+                "series) or the mouse's own software. A key the desktop knows (like 3) also types while "
+                "the dial is off."
+            ),
+        )
+        tip.set_subtitle_lines(0)
+        options.append(tip)
+        for row in options:
+            row.set_sensitive(mouse.enabled)
+            group.add(row)
         return group
 
     def _spawn(self, argv, failed, finished=None):
@@ -3918,9 +4013,11 @@ class Application(Adw.Application):
         rows["environment"].set_subtitle(
             f"{status.get('session_type') or 'unknown session'} · {status.get('layout') or 'unknown layout'}"
         )
-        rows["touchpad"].set_subtitle(
-            f"{status.get('touchpad') or 'unknown'} · {'emulated dial' if status.get('emulation') else 'DialPad'}"
-        )
+        if status.get("mouse"):
+            dial_mode = f"Mouse-only mode · {status.get('mouse_device')}" if status.get("mouse_device") else "Mouse-only mode"
+        else:
+            dial_mode = f"{'Touchpad mode' if status.get('emulation') else 'DialPad mode'} · {status.get('touchpad') or 'unknown'}"
+        rows["touchpad"].set_subtitle(dial_mode)
         rows["configuration"].set_subtitle(self._configuration_state(status))
         max_x, max_y = int(status.get("touchpad_max_x") or 0), int(status.get("touchpad_max_y") or 0)
         if max_x > 0 and max_y > 0:

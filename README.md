@@ -1,6 +1,6 @@
-# Turnpad — touchpad dial for ASUS laptops
+# Turnpad — a dial for ASUS DialPads, any touchpad or a mouse
 
-Turnpad turns the DialPad printed on the touchpad of ASUS laptops into an ASUS Dial-style controller on Linux: a radial menu of functions, per-application profiles, an on-screen dial with skins and a settings app.
+Turnpad turns the DialPad printed on the touchpad of ASUS laptops — or any other touchpad, or a mouse — into an ASUS Dial-style controller on Linux: a radial menu of functions, per-application profiles, an on-screen dial with skins and a settings app.
 
 > **Based on [asus-linux-drivers/asus-dialpad-driver](https://github.com/asus-linux-drivers/asus-dialpad-driver)**
 > by Lukáš Drahník (GPL-2.0). Turnpad started as a personal fork of it: the touchpad handling,
@@ -16,7 +16,17 @@ What Turnpad adds to the original driver:
 - **Groups**: a sector that opens a straight list of more functions beside the dial; turn to move along it, tap the centre to choose. More functions fit without smaller sectors.
 - **GNOME Shell overlay**: native radial dial with value gauge, rotation hints and finger position; size, position (anywhere on the screen or next to the mouse pointer) and visibility configurable: always visible, fading while you turn, or a small label instead of the dial — for all apps, per profile or per function.
 - **Guided calibration** that measures the dial on any DialPad touchpad — see [PORTING.md](PORTING.md).
-- **Touchpads without a DialPad**: the driver can emulate one on any touchpad (*Driver → Emulate the DialPad*); while it is on, the whole touchpad is the dial, switched with the touchpad's corner or a keyboard shortcut — see [PORTING.md](PORTING.md#touchpads-without-a-dialpad).
+- **Three modes**: the dial works with the DialPad printed on an ASUS touchpad, with any other touchpad, or with just a mouse — see [Modes](#modes).
+
+## Modes
+
+| Mode | For | Switch on / off | Turn | Choose / centre | Back | Enable |
+| --- | --- | --- | --- | --- | --- | --- |
+| **DialPad mode** | ASUS laptop with the DialPad printed on the touchpad | hold the illuminated top-right corner | circle a finger on the printed ring | tap the centre button | hold the centre button | default; calibrate once on other models ([details](PORTING.md#running-the-dialpad-on-another-laptop-model)) |
+| **Touchpad mode** | any other touchpad (also on laptops of other makes) | hold the touchpad's top-right corner, or a keyboard shortcut | circle a finger anywhere on the touchpad | tap the middle of the touchpad | hold the middle | *Driver → Touchpad mode* ([details](PORTING.md#touchpad-mode-touchpads-without-a-dialpad)) |
+| **Mouse-only mode** | computer without a touchpad (desktop PC) | a key the mouse sends (F13, e.g. a side button mapped with Piper) | mouse wheel, or move the mouse in circles | left click, or the middle button | right click, or hold the middle button | *Driver → Mouse-only mode* ([details](PORTING.md#mouse-only-mode-computers-without-a-touchpad)) |
+
+In Touchpad mode the whole touchpad is the dial and the pointer stands still while it is on; in Mouse-only mode the driver grabs the mouse while the dial is on. Everything else (profiles, functions, on-screen dial, skins) is the same in all three.
 
 ### Install
 
@@ -37,7 +47,7 @@ cd asus-turnpad
 bash install.sh
 ```
 
-Then log out and back in, hold the illuminated corner of the touchpad to switch the DialPad on, and open **Turnpad** from the applications menu. On a laptop that is not listed, run *Calibration → Guided calibration* there once.
+Then log out and back in, switch the dial on (DialPad mode: hold the illuminated corner of the touchpad; for Touchpad mode and Mouse-only mode see [Modes](#modes)), and open **Turnpad** from the applications menu. On a laptop that is not listed, run *Calibration → Guided calibration* there once.
 
 | | Arch package | `install.sh` |
 | --- | --- | --- |

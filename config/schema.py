@@ -94,6 +94,29 @@ class EmulationConfig:
 
 
 @dataclass
+class MouseConfig:
+    # A mouse drives the dial on a computer without a touchpad: the wheel
+    # turns it, the middle button is the centre, and a key the mouse sends
+    # (from its onboard memory or Piper/Solaar: F13, KEY_3) switches it on and
+    # off. While the dial is on the driver grabs the mouse; the left button
+    # selects, the right one goes back. Read at driver
+    # start; the settings app restarts it.
+    enabled: bool = False
+    # Part of the input device's name; "" = the first device that has the
+    # toggle key and a wheel.
+    device: str = ""
+    # evdev key or button name; "F13" is read as KEY_F13.
+    toggle_key: str = "KEY_F13"
+    # The direction the mouse moves is the dial's angle (move towards a
+    # tile, circle to turn). Nothing happens until the hand has travelled 35 %
+    # of motion_radius mouse counts; half of it is the stretch the direction
+    # is measured over (smaller = more sensitive). Off: only the wheel and
+    # the buttons.
+    motion: bool = False
+    motion_radius: int = 300
+
+
+@dataclass
 class OverlayConfig:
     """Appearance of the GNOME Shell dial; read directly by the extension."""
 
@@ -271,6 +294,7 @@ class DialPadConfig:
     overlay: OverlayConfig = field(default_factory=OverlayConfig)
     backlight: BacklightConfig = field(default_factory=BacklightConfig)
     emulation: EmulationConfig = field(default_factory=EmulationConfig)
+    mouse: MouseConfig = field(default_factory=MouseConfig)
     profiles: list[Profile] = field(default_factory=list)
 
 
@@ -343,6 +367,15 @@ def _clamp(value, minimum, maximum, default):
     return max(minimum, min(number, maximum))
 
 
+def normalize_key_name(value, default):
+    """An evdev key name as typed ("f13", "KEY_3") in its KEY_ form."""
+    if not isinstance(value, str) or not value.strip():
+        return default
+    name = value.strip().upper().replace(" ", "_")
+    # Mouse buttons (BTN_SIDE, BTN_EXTRA) can switch the dial as well.
+    return name if name.startswith(("KEY_", "BTN_")) else f"KEY_{name}"
+
+
 def _encoder(obj):
     if isinstance(obj, DialPadConfig):
         return {
@@ -354,9 +387,10 @@ def _encoder(obj):
             "overlay": _encoder(obj.overlay),
             "backlight": _encoder(obj.backlight),
             "emulation": _encoder(obj.emulation),
+            "mouse": _encoder(obj.mouse),
             "profiles": [_encoder(p) for p in obj.profiles],
         }
-    if isinstance(obj, (TouchGeometry, ActivationConfig, GestureConfig, OverlayConfig, BacklightConfig, EmulationConfig)):
+    if isinstance(obj, (TouchGeometry, ActivationConfig, GestureConfig, OverlayConfig, BacklightConfig, EmulationConfig, MouseConfig)):
         return {item.name: getattr(obj, item.name) for item in fields(obj)}
     if isinstance(obj, Profile):
         result: dict = {
@@ -439,6 +473,7 @@ def _decoder(d: dict, cls: type):
             overlay=_decoder(d.get("overlay", {}), OverlayConfig),
             backlight=_decoder(d.get("backlight", {}), BacklightConfig),
             emulation=_decoder(d.get("emulation", {}), EmulationConfig),
+            mouse=_decoder(d.get("mouse", {}), MouseConfig),
             profiles=[_decoder(p, Profile) for p in d.get("profiles", [])],
         )
     if cls is TouchGeometry:
@@ -476,6 +511,15 @@ def _decoder(d: dict, cls: type):
             enabled=bool(d.get("enabled", False)),
             corner=bool(d.get("corner", True)),
             center_size=int(_clamp(d.get("center_size", 30), 10, 60, 30)),
+        )
+    if cls is MouseConfig:
+        device = d.get("device", "")
+        return MouseConfig(
+            enabled=bool(d.get("enabled", False)),
+            device=device.strip() if isinstance(device, str) else "",
+            toggle_key=normalize_key_name(d.get("toggle_key", "KEY_F13"), "KEY_F13"),
+            motion=bool(d.get("motion", False)),
+            motion_radius=int(_clamp(d.get("motion_radius", 300), 50, 2000, 300)),
         )
     if cls is Profile:
         mode = d.get("mode", "multi")

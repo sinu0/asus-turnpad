@@ -42,10 +42,12 @@ import socket
 import json
 import queue
 import hashlib
+import select
 
 import launch
 import layout_detect
 from dir_watch import DirectoryWatcher
+from mouse_dial import MouseDial, MousePointer, find_mouse
 from desktop import keyboard_layout
 from backlight import KeyboardBacklight, commands_for_level
 from config.identity import SLUG, socket_path
@@ -182,8 +184,8 @@ def process_pending_driver_updates(gesture_idle=True):
 def on_dbus_start_calibration():
     global pending_calibration
 
-    # An emulated dial has no printed ring to trace.
-    if emulation:
+    # An emulated dial has no printed ring to trace, a mouse no touchpad.
+    if emulation or mouse_mode:
         return False
     with driver_state_lock:
         pending_calibration = "start"
@@ -281,6 +283,8 @@ def get_dbus_status():
         "touchpad_max_y": int(globals().get("max_y") or 0),
         "calibrating": calibration is not None,
         "emulation": bool(emulation),
+        "mouse": bool(mouse_mode),
+        "mouse_device": getattr(globals().get("mouse_device"), "name", "") or "",
         "touchpad": touchpad_name or "",
         "config_revision": config_state["revision"],
         "config_error": config_state["error"],
@@ -554,8 +558,10 @@ def apply_gui_settings():
     activation = gui_config.activation
     gesture = gui_config.gesture
 
-    if gui_config.emulation.enabled != emulation:
+    if (gui_config.emulation.enabled and not mouse_mode) != emulation:
         log.info("DialPad emulation %s after the driver restarts", "starts" if gui_config.emulation.enabled else "ends")
+    if gui_config.mouse.enabled != mouse_mode:
+        log.info("Mouse dial %s after the driver restarts", "starts" if gui_config.mouse.enabled else "ends")
 
     if emulation:
         # The emulated dial follows the touchpad, not a calibrated geometry.
@@ -599,15 +605,24 @@ def apply_gui_settings():
 
 load_gui_shortcuts()
 
+# Mouse dial (config.json "mouse") for computers without a touchpad: a mouse
+# key switches the dial, the wheel turns it, the middle button is the centre.
+# No touchpad, no DialPad hardware. Read once; the settings app restarts the
+# driver when it changes.
+mouse_mode = bool(gui_config is not None and gui_config.mouse.enabled)
 # DialPad emulation (config.json "emulation") for touchpads without a DialPad:
 # any touchpad, no commands to its hardware (no light, nothing to unlock), the
-# whole touchpad is the dial while it is on. Read once; the settings app
-# restarts the driver when it changes.
-emulation = bool(gui_config is not None and gui_config.emulation.enabled)
+# whole touchpad is the dial while it is on. Read once likewise; the mouse dial
+# replaces it when both are set.
+emulation = bool(gui_config is not None and gui_config.emulation.enabled) and not mouse_mode
 emulation_corner = True
 # Touchpads whose axes differ in resolution: x distances times this.
 x_scale = 1.0
-if emulation:
+if mouse_mode:
+    log.info("Mouse dial: the wheel turns the dial, the middle button is its centre")
+    if gui_config.emulation.enabled:
+        log.warning("Mouse dial and DialPad emulation are both on; the mouse dial wins")
+elif emulation:
     log.info("DialPad emulation: the whole touchpad is the dial while it is on")
 
 # Figure out devices from devices file
@@ -640,7 +655,9 @@ while try_times > 0:
             # https://github.com/asus-linux-drivers/asus-numberpad-driver/issues/161
             # https://github.com/asus-linux-drivers/asus-numberpad-driver/issues/198
             # https://github.com/asus-linux-drivers/asus-stylus-driver/issues/17
-            if touchpad_detected == 0 and emulation and line.startswith("N: Name=") and layout_detect.is_touchpad(line) and "DialPad" not in line:
+            if mouse_mode:
+                pass
+            elif touchpad_detected == 0 and emulation and line.startswith("N: Name=") and layout_detect.is_touchpad(line) and "DialPad" not in line:
                 touchpad_detected = 1
                 log.info('Detecting touchpad for the emulated dial from string: \"%s\"', line.strip())
                 touchpad_name = line.split("\"")[1]
@@ -690,23 +707,30 @@ while try_times > 0:
             #if touchpad_detected == 2 and keyboard_detected == 2:
             #    break
 
-    if touchpad_detected != 2 or keyboard_detected != 2:
+    # The mouse dial needs no touchpad (the mouse is looked for later, and
+    # again whenever it is gone).
+    if (touchpad_detected != 2 and not mouse_mode) or keyboard_detected != 2:
         try_times -= 1
         if try_times == 0:
-            with open('/proc/bus/input/devices', 'r') as f:
-                lines = f.readlines()
-                for line in lines:
-                    log.error(line)
-            if keyboard_detected != 2:
+            if mouse_mode:
+                # Not an error without a touchpad, and nothing to dump.
+                if keyboard_detected != 2:
+                    log.info("No ASUS keyboard; Ctrl/Shift/Alt variants of functions need it")
+            else:
+                with open('/proc/bus/input/devices', 'r') as f:
+                    lines = f.readlines()
+                    for line in lines:
+                        log.error(line)
+            if keyboard_detected != 2 and not mouse_mode:
                 log.error("Can't find keyboard (code: %s)", keyboard_detected)
                 # keyboard is optional, no sys.exit(1)!
-            if touchpad_detected != 2:
+            if touchpad_detected != 2 and not mouse_mode:
                 log.error("Can't find touchpad (code: %s)", touchpad_detected)
                 if not emulation:
-                    log.error("No touchpad with a DialPad found; other touchpads need Driver > Emulate the DialPad in the settings app")
+                    log.error("No touchpad with a DialPad found; other touchpads need Driver > Touchpad mode in the settings app")
                 sys.exit(1)
             # The emulation never talks to the touchpad over I2C.
-            if touchpad_detected == 2 and not emulation and not device_id.isnumeric():
+            if touchpad_detected == 2 and not emulation and not mouse_mode and not device_id.isnumeric():
                 log.error("Can't find device id")
                 sys.exit(1)
     else:
@@ -714,8 +738,8 @@ while try_times > 0:
 
     sleep(try_sleep)
 
-# The emulation sends nothing to the touchpad: no hidraw, no I2C bus.
-if emulation:
+# The emulation and the mouse dial send nothing to the touchpad: no hidraw, no I2C bus.
+if emulation or mouse_mode:
     hidraw_path = None
 else:
     # Is the hidraw node of the touchpad usable? (preferred, I2C is a fallback)
@@ -782,16 +806,23 @@ config_file_path = config_file_dir + CONFIG_FILE_NAME
 config = configparser.ConfigParser()
 config_lock = threading.Lock()
 
-# Start monitoring the touchpad
-fd_t = open('/dev/input/event' + str(touchpad), 'rb')
-d_t = Device(fd_t)
+# Start monitoring the touchpad (the mouse dial has none: its device is opened
+# by listen_mouse_events())
+if mouse_mode:
+    fd_t = None
+    d_t = None
+    abs_x = abs_y = None
+    min_x = max_x = min_y = max_y = 0
+else:
+    fd_t = open('/dev/input/event' + str(touchpad), 'rb')
+    d_t = Device(fd_t)
 
-# Get touchpad dimensions
-abs_x = d_t.absinfo[EV_ABS.ABS_X]
-abs_y = d_t.absinfo[EV_ABS.ABS_Y]
-min_x, max_x = abs_x.minimum, abs_x.maximum
-min_y, max_y = abs_y.minimum, abs_y.maximum
-log.info('Touchpad min-max: x %d-%d, y %d-%d', min_x, max_x, min_y, max_y)
+    # Get touchpad dimensions
+    abs_x = d_t.absinfo[EV_ABS.ABS_X]
+    abs_y = d_t.absinfo[EV_ABS.ABS_Y]
+    min_x, max_x = abs_x.minimum, abs_x.maximum
+    min_y, max_y = abs_y.minimum, abs_y.maximum
+    log.info('Touchpad min-max: x %d-%d, y %d-%d', min_x, max_x, min_y, max_y)
 
 def apply_emulated_geometry():
     """Ring, centre button and corner of the emulated dial, from the touchpad's size."""
@@ -1042,8 +1073,8 @@ def send_value_to_touchpad_via_hidraw(value):
     return False
 
 def send_value_to_touchpad(value):
-    # A touchpad without a DialPad gets no DialPad commands.
-    if emulation:
+    # A touchpad without a DialPad (or none at all) gets no DialPad commands.
+    if emulation or mouse_mode:
         return True
     if send_value_to_touchpad_via_hidraw(value):
         return True
@@ -1171,8 +1202,9 @@ def initialize_virtual_device():
     try:
         # create the virtual device
         dev = Device()
-        # Other makes' touchpads may have a one-word name.
-        dev.name = " ".join(touchpad_name.split(" ")[:2]) + " DialPad"
+        # Other makes' touchpads may have a one-word name. The suffix keeps
+        # the mouse finder (find_mouse) from taking this device for a mouse.
+        dev.name = " ".join((touchpad_name or "Mouse").split(" ")[:2]) + " DialPad"
 
         # aggregate all shortcuts to enable
         shortcuts_to_enable = {}
@@ -2276,6 +2308,165 @@ def leave_function():
     else:
         return_to_multifunction_menu()
 
+def release_center(duration_held, hold_fired):
+    """The centre button is let go: a finger lifted from it, or the mouse's
+    middle button released. A hold already went back (hold_fired)."""
+    if multi_app_mode:
+        if hold_fired:
+            return
+        if center_activated:
+            # Tap runs the function's own centre action
+            # (for example "Fit image"); a long press or a
+            # function without one returns to the menu.
+            if duration_held < center_hold_time and function_has_center_action(title):
+                selected_shortcuts = function_entry(title)
+                function_title = title
+                modifiers = set(active_modifiers)
+                enqueue_action(
+                    lambda selected_shortcuts=selected_shortcuts, modifiers=modifiers, function_title=function_title:
+                        run_function_center_action(selected_shortcuts, modifiers, function_title)
+                )
+            else:
+                leave_function()
+        else:
+            select_multifunction_segment()
+    else:
+        shortcuts = app_specific_shortcuts
+        function_title = title
+        modifiers = set(active_modifiers)
+        enqueue_action(
+            lambda shortcuts=shortcuts, modifiers=modifiers, duration_held=duration_held, function_title=function_title:
+                run_center_action(shortcuts, modifiers, duration_held, function_title)
+        )
+
+def show_menu_after_gesture():
+    """Back to showing the menu (or the open list) when no function is selected."""
+    if multi_app_mode and not center_activated:
+        if submenu:
+            show_submenu()
+        else:
+            show_multifunction_menu()
+
+def queue_rotation_action(shortcuts, direction, scroll_multiplier, function_title, show_value, value_source):
+    """One turning step of the selected function, run on the action thread."""
+    modifiers = set(active_modifiers)
+    enqueue_action(
+        lambda: run_rotation_action(shortcuts, direction, modifiers, scroll_multiplier, function_title, show_value, value_source)
+    )
+
+def rotate_selected_function(direction):
+    """A turning step without the touch loop's threshold (the mouse wheel's notch)."""
+    settings = function_settings(title)
+    shortcuts = function_entry(title) if center_activated else {}
+    if not shortcuts:
+        shortcuts = app_specific_shortcuts
+    scroll_multiplier = profile_float("scroll_speed") if shortcut_has_scroll_action(shortcuts, direction) else 1
+    queue_rotation_action(shortcuts, direction, scroll_multiplier, title, True, settings if settings else shortcuts)
+
+def rotate_menu_highlight(direction):
+    """One step along the radial menu, wrapping around; empty sectors are skipped."""
+    global title
+
+    titles = multi_app_mode_titles or []
+    filled = [index for index, menu_title in enumerate(titles) if menu_title]
+    if not filled:
+        return False
+    step = 1 if direction == "clockwise" else -1
+    if title and title in titles:
+        index = filled[(filled.index(titles.index(title)) + step) % len(filled)]
+    else:
+        index = filled[0] if step > 0 else filled[-1]
+    title = titles[index]
+    if overlay_enabled():
+        send_to_socket({"titles": multi_app_mode_titles, "icons": multi_app_mode_icons, "title": title})
+    return True
+
+def highlight_menu_slice(slice_idx):
+    """Highlight the radial menu's sector ``slice_idx`` (a finger's slice, or
+    the mouse pointer's)."""
+    global title
+
+    try:
+        title = multi_app_mode_titles[slice_idx]
+    except IndexError:
+        title = None
+
+    if overlay_enabled():
+        send_to_socket({"titles": multi_app_mode_titles, "icons": multi_app_mode_icons, "title": title})
+
+def turn_selected_function(rotation, angle):
+    """The finger's (or the mouse pointer's) angle in a selected function or
+    the single function: the tracker's threshold crossings run its turning
+    actions, the progress goes to the overlay."""
+    global treshold
+
+    settings = function_settings(title)
+    try:
+        treshold = int(settings["treshold"])
+    except (KeyError, TypeError, ValueError):
+        treshold = default_treshold
+
+    # A scroll uses a smaller angular step for smooth low-speed
+    # control.  Other actions retain their configured threshold.
+    sht = function_entry(title) if center_activated else {}
+    if not sht:
+        sht = app_specific_shortcuts
+    is_scroll_action = shortcut_has_scroll_action(sht, "clockwise") or shortcut_has_scroll_action(sht, "counterclockwise")
+    trigger_threshold = min(treshold, SCROLL_TRIGGER_DEGREES) if is_scroll_action else treshold
+    # Per-application sensitivity, as in ASUS Dial settings.
+    trigger_threshold = max(2, trigger_threshold / profile_float("sensitivity"))
+    show_progress = trigger_threshold >= socket_send_progress_above_treshold
+
+    previous_progress = rotation.progress(trigger_threshold)
+    triggered = rotation.update(angle, time(), trigger_threshold)
+
+    if triggered is None:
+        progress = rotation.progress(trigger_threshold)
+        if show_progress and overlay_enabled() and abs(progress - previous_progress) >= 3:
+            send_to_socket({
+                "value_angle_start": rotation.start_angle or 0.0,
+                "value": progress,
+                "title": title,
+                "value_show_only_progress": True
+            })
+    else:
+        direction, degrees_per_second = triggered
+        scroll_multiplier = (
+            scroll_acceleration_multiplier(degrees_per_second)
+            * profile_float("scroll_speed")
+            if shortcut_has_scroll_action(sht, direction)
+            else 1
+        )
+        log.debug(
+            "Threshold crossed (%s) at %.0f°/s, scroll multiplier x%d",
+            direction,
+            degrees_per_second,
+            scroll_multiplier,
+        )
+
+        if show_progress and overlay_enabled():
+            send_to_socket({
+                "value_angle_start": rotation.start_angle or 0.0,
+                "value": 0,
+                "title": title,
+                "value_show_only_progress": True
+            })
+
+        queue_rotation_action(
+            sht, direction, scroll_multiplier, title,
+            not show_progress, settings if settings else sht,
+        )
+
+def rotate_dial(direction):
+    """One step of the dial for the mouse wheel: along the menu, along an
+    open list, or turning the selected function."""
+    if multi_app_mode and submenu and not center_activated:
+        move_submenu_highlight(direction)
+    elif multi_app_mode and not center_activated:
+        rotate_menu_highlight(direction)
+    else:
+        rotate_selected_function(direction)
+
 window_binary = None
 
 def update_touch_slots(slots, current_slot, event):
@@ -2543,78 +2734,12 @@ def listen_touchpad_events():
                                             current_slice_idx,
                                         )
 
-                                        try:
-                                            title = multi_app_mode_titles[current_slice_idx]
-                                        except IndexError:
-                                            title = None
-
-                                        if overlay_enabled():
-                                            send_to_socket({"titles": multi_app_mode_titles, "icons": multi_app_mode_icons, "title": title})
+                                        highlight_menu_slice(current_slice_idx)
 
                                         last_slice = current_slice_idx
                                 elif settle_counter >= SETTLE_FRAMES:
 
-                                    settings = function_settings(title)
-                                    try:
-                                        treshold = int(settings["treshold"])
-                                    except (KeyError, TypeError, ValueError):
-                                        treshold = default_treshold
-
-                                    # A scroll uses a smaller angular step for smooth low-speed
-                                    # control.  Other actions retain their configured threshold.
-                                    sht = function_entry(title) if center_activated else {}
-                                    if not sht:
-                                        sht = app_specific_shortcuts
-                                    is_scroll_action = shortcut_has_scroll_action(sht, "clockwise") or shortcut_has_scroll_action(sht, "counterclockwise")
-                                    trigger_threshold = min(treshold, SCROLL_TRIGGER_DEGREES) if is_scroll_action else treshold
-                                    # Per-application sensitivity, as in ASUS Dial settings.
-                                    trigger_threshold = max(2, trigger_threshold / profile_float("sensitivity"))
-                                    show_progress = trigger_threshold >= socket_send_progress_above_treshold
-
-                                    previous_progress = rotation.progress(trigger_threshold)
-                                    triggered = rotation.update(angle, time(), trigger_threshold)
-
-                                    if triggered is None:
-                                        progress = rotation.progress(trigger_threshold)
-                                        if show_progress and overlay_enabled() and abs(progress - previous_progress) >= 3:
-                                            send_to_socket({
-                                                "value_angle_start": rotation.start_angle or 0.0,
-                                                "value": progress,
-                                                "title": title,
-                                                "value_show_only_progress": True
-                                            })
-                                    else:
-                                        direction, degrees_per_second = triggered
-                                        scroll_multiplier = (
-                                            scroll_acceleration_multiplier(degrees_per_second)
-                                            * profile_float("scroll_speed")
-                                            if shortcut_has_scroll_action(sht, direction)
-                                            else 1
-                                        )
-                                        log.debug(
-                                            "Threshold crossed (%s) at %.0f°/s, scroll multiplier x%d",
-                                            direction,
-                                            degrees_per_second,
-                                            scroll_multiplier,
-                                        )
-
-                                        if show_progress and overlay_enabled():
-                                            send_to_socket({
-                                                "value_angle_start": rotation.start_angle or 0.0,
-                                                "value": 0,
-                                                "title": title,
-                                                "value_show_only_progress": True
-                                            })
-
-                                        function_title = title
-                                        modifiers = set(active_modifiers)
-                                        value_source = settings if settings else sht
-                                        enqueue_action(
-                                            lambda sht=sht, direction=direction, multiplier=scroll_multiplier,
-                                                   modifiers=modifiers, function_title=function_title, show_value=not show_progress,
-                                                   value_source=value_source:
-                                                run_rotation_action(sht, direction, modifiers, multiplier, function_title, show_value, value_source)
-                                        )
+                                    turn_selected_function(rotation, angle)
                         else:
                             rotation.reset()
                             if first_touch_outside:
@@ -2632,39 +2757,13 @@ def listen_touchpad_events():
                         if last_pointer_angle is not None:
                             last_pointer_angle = None
                             send_details(pointer=-1)
-                        if multi_app_mode:
-                            if center_button_triggered and center_hold_fired:
-                                pass
-                            elif center_button_triggered:
-                                if center_activated:
-                                    # Tap runs the function's own centre action
-                                    # (for example "Fit image"); a long press or a
-                                    # function without one returns to the menu.
-                                    if duration_held < center_hold_time and function_has_center_action(title):
-                                        selected_shortcuts = function_entry(title)
-                                        function_title = title
-                                        modifiers = set(active_modifiers)
-                                        enqueue_action(
-                                            lambda selected_shortcuts=selected_shortcuts, modifiers=modifiers, function_title=function_title:
-                                                run_function_center_action(selected_shortcuts, modifiers, function_title)
-                                        )
-                                    else:
-                                        leave_function()
-                                else:
-                                    select_multifunction_segment()
-                            elif not center_activated and title and not submenu:
-                                # A tap on an outer menu sector selects it
-                                # directly; in a list, lifting after turning
-                                # only leaves the highlight where it is.
-                                select_multifunction_segment()
-                        elif center_button_triggered:
-                            shortcuts = app_specific_shortcuts
-                            function_title = title
-                            modifiers = set(active_modifiers)
-                            enqueue_action(
-                                lambda shortcuts=shortcuts, modifiers=modifiers, duration_held=duration_held, function_title=function_title:
-                                    run_center_action(shortcuts, modifiers, duration_held, function_title)
-                            )
+                        if center_button_triggered:
+                            release_center(duration_held, center_hold_fired)
+                        elif multi_app_mode and not center_activated and title and not submenu:
+                            # A tap on an outer menu sector selects it
+                            # directly; in a list, lifting after turning
+                            # only leaves the highlight where it is.
+                            select_multifunction_segment()
 
                         if center_button_triggered and overlay_enabled():
                             send_to_socket({"input": "center", "value": 0, "title": title})
@@ -2673,11 +2772,7 @@ def listen_touchpad_events():
                         center_hold_fired = False
                         center_enter_time = 0
 
-                        if multi_app_mode and not center_activated:
-                            if submenu:
-                                show_submenu()
-                            else:
-                                show_multifunction_menu()
+                        show_menu_after_gesture()
 
                         if touching_sent:
                             touching_sent = False
@@ -2719,6 +2814,314 @@ def listen_touchpad_events():
             rotation.reset()
         except Exception:
             log.exception("Error in listen_touchpad_events")
+            break
+
+# Mouse dial: the mouse is looked for every MOUSE_RETRY_SECONDS (a wireless
+# receiver may not be plugged in yet, or goes away), the loop wakes every
+# MOUSE_POLL_SECONDS for the hold of the middle button and for a dial switched
+# over D-Bus.
+MOUSE_RETRY_SECONDS = 2
+MOUSE_POLL_SECONDS = 0.05
+mouse_device = None
+mouse_file = None
+mouse_grabbed = False
+# The loop grabs, the action thread and cleanup() may release.
+mouse_lock = threading.Lock()
+
+def mouse_toggle_key():
+    """The configured toggle key as an evdev code (KEY_F13 if it is unknown)."""
+    name = gui_config.mouse.toggle_key if gui_config is not None else "KEY_F13"
+    key = getattr(EV_KEY, name, None)
+    if key is None or not isinstance(key, type(EV_KEY.KEY_F13)):
+        log.error("Mouse dial: unknown toggle key %s, using KEY_F13", name)
+        key = EV_KEY.KEY_F13
+    return key
+
+def set_mouse_grab(owns):
+    """Keep the pointer, the clicks and the wheel from the desktop while the dial is on."""
+    global mouse_grabbed
+
+    with mouse_lock:
+        if mouse_device is None or owns == mouse_grabbed:
+            return
+        try:
+            if owns:
+                mouse_device.grab()
+            else:
+                mouse_device.ungrab()
+        except Exception:
+            log.warning("Could not %s the mouse", "grab" if owns else "release", exc_info=True)
+        # Not tried again every poll; a mouse someone else grabbed stays theirs.
+        mouse_grabbed = owns
+
+def close_mouse():
+    """Let the mouse go (ungrabbed) after the dial or the device is gone."""
+    global mouse_device, mouse_file, mouse_grabbed
+
+    with mouse_lock:
+        if mouse_device is not None and mouse_grabbed:
+            try:
+                mouse_device.ungrab()
+            except Exception:
+                pass
+        mouse_grabbed = False
+        mouse_device = None
+        if mouse_file is not None:
+            try:
+                mouse_file.close()
+            except Exception:
+                pass
+            mouse_file = None
+
+def open_mouse(key_code):
+    """Open the configured mouse if it is there; False when it is not."""
+    global mouse_device, mouse_file, mouse_grabbed
+
+    try:
+        with open("/proc/bus/input/devices", "r") as devices:
+            node = find_mouse(devices.read(), gui_config.mouse.device, key_code)
+    except OSError:
+        return False
+    if node is None:
+        return False
+    handle = None
+    try:
+        handle = open("/dev/input/" + node, "rb")
+        os.set_blocking(handle.fileno(), False)
+        opened = Device(handle)
+    except Exception as error:
+        log.warning("Can not open the mouse /dev/input/%s: %s", node, error)
+        if handle is not None:
+            handle.close()
+        return False
+    with mouse_lock:
+        mouse_file = handle
+        mouse_device = opened
+        mouse_grabbed = False
+    log.info('Mouse dial: using "%s" (%s)', opened.name, node)
+    return True
+
+def listen_mouse_events():
+    """The mouse dial's loop, on the main thread like the touch loop: the
+    toggle key switches the dial, the wheel turns it, the middle and left
+    buttons are the centre (left: select, middle: also hold to go back), the
+    right button goes back, and with config mouse.motion the direction the
+    mouse moves is the dial's angle (see MouseDial, MousePointer)."""
+    global last_event_time, title, center_activated, treshold
+
+    title = None
+    center_activated = False
+    treshold = None
+
+    DEBOUNCE_MS = 30
+    # Same rule as the touch loop: at most one finger dot update per step.
+    POINTER_STEP_DEGREES = 1
+
+    settings = gui_config.mouse if gui_config is not None else None
+    motion = bool(settings is not None and settings.motion)
+    toggle_key = mouse_toggle_key()
+    key_code = toggle_key.value
+    mouse = MouseDial(center_hold_time)
+    pointer = MousePointer(settings.motion_radius if settings is not None else 300)
+    rotation = RotationTracker(angle_hysteresis, DEBOUNCE_MS)
+    touching_sent = False
+    # A centre button went down on something it can act on (it needs a
+    # highlighted entry, like a finger on the centre).
+    center_pressed = False
+    last_slice = None
+    last_pointer_angle = None
+    # What the heading means: it starts again when this changes.
+    last_context = None
+    next_search = 0
+    reported_missing = False
+
+    log.info(
+        "Listening to mouse events (toggle key %s, motion %s)...",
+        toggle_key.name, "on" if motion else "off",
+    )
+
+    def centre_point():
+        """No heading yet (the hand has to travel again), no finger dot."""
+        nonlocal last_slice, last_pointer_angle
+
+        pointer.reset()
+        rotation.reset()
+        last_slice = None
+        if last_pointer_angle is not None:
+            last_pointer_angle = None
+            send_details(pointer=-1)
+
+    def follow_motion():
+        """The hand's heading as a finger's angle: the sector it points to, a
+        list's highlight or the selected function's turning."""
+        nonlocal last_slice, last_pointer_angle
+
+        if pointer.in_dead_zone:
+            # Like a finger in the centre button.
+            rotation.reset()
+            if last_pointer_angle is not None:
+                last_pointer_angle = None
+                send_details(pointer=-1)
+            return
+        angle = pointer.angle()
+        rotation.hysteresis = angle_hysteresis
+        if pointer.jumped:
+            # The hand reversed: a new reference, not a turn that fires actions.
+            # (In the menu a jump just picks the new sector.)
+            rotation.reset()
+        if show_pointer_enabled() and (
+            last_pointer_angle is None
+            or abs((angle - last_pointer_angle + 180) % 360 - 180) >= POINTER_STEP_DEGREES
+        ):
+            last_pointer_angle = angle
+            send_details(pointer=round(angle, 1))
+        if multi_app_mode and submenu and not center_activated:
+            moved = rotation.update(angle, time(), max(2, SUBMENU_STEP_DEGREES / profile_float("sensitivity")))
+            if moved is not None:
+                move_submenu_highlight(moved[0])
+        elif multi_app_mode and not center_activated:
+            slice_idx = slice_index(angle, max(len(multi_app_mode_titles or []), slices_minimum_count))
+            if slice_idx != last_slice:
+                last_slice = slice_idx
+                highlight_menu_slice(slice_idx)
+        else:
+            turn_selected_function(rotation, angle)
+
+    def press_center():
+        nonlocal center_pressed
+
+        if title:
+            if overlay_enabled():
+                send_to_socket({"input": "center", "value": 1, "title": title})
+            center_pressed = True
+
+    def handle(action):
+        nonlocal center_pressed
+
+        if action.kind == "toggle":
+            toggle_top_right_icon(dialpad)
+            mouse.set_active(dialpad)
+        elif action.kind == "rotate":
+            rotate_dial(action.direction)
+        elif action.kind == "center_press":
+            press_center()
+        elif action.kind == "center_hold":
+            if center_pressed and multi_app_mode and (center_activated or submenu):
+                leave_function()
+        elif action.kind == "center_release":
+            if center_pressed:
+                release_center(action.duration, action.hold_fired)
+                if overlay_enabled():
+                    send_to_socket({"input": "center", "value": 0, "title": title})
+                center_pressed = False
+                show_menu_after_gesture()
+        elif action.kind == "back":
+            if multi_app_mode and (center_activated or submenu):
+                leave_function()
+
+    while not stop_threads:
+        try:
+            if mouse_device is None:
+                # Updates from D-Bus (focus, configuration, Toggle) still apply.
+                process_pending_driver_updates()
+                if time() >= next_search:
+                    next_search = time() + MOUSE_RETRY_SECONDS
+                    if open_mouse(key_code):
+                        reported_missing = False
+                    elif not reported_missing:
+                        reported_missing = True
+                        log.warning(
+                            'No mouse with %s and a wheel found%s; looking again every %d s',
+                            toggle_key.name,
+                            f' named "{gui_config.mouse.device}"' if gui_config.mouse.device else "",
+                            MOUSE_RETRY_SECONDS,
+                        )
+                sleep(MOUSE_POLL_SECONDS)
+                continue
+
+            readable, _, _ = select.select([mouse_file], [], [], MOUSE_POLL_SECONDS)
+
+            mouse.hold_time = center_hold_time
+            # The dial can also be switched over D-Bus or by the inactivity timer.
+            mouse.set_active(dialpad)
+
+            moved_x = moved_y = 0
+            if readable:
+                events = []
+                try:
+                    for event in mouse_device.events():
+                        events.append(event)
+                except device.EventsDroppedException:
+                    log.debug("Mouse events dropped; resynchronising")
+                    for _ in mouse_device.sync():
+                        pass
+                for event in events:
+                    last_event_time = time()
+                    if event.matches(toggle_key):
+                        actions = mouse.toggle_key(event.value)
+                    elif event.matches(EV_REL.REL_WHEEL):
+                        # REL_WHEEL_HI_RES is ignored: one notch, one step.
+                        actions = mouse.wheel(event.value)
+                    elif event.matches(EV_KEY.BTN_MIDDLE):
+                        actions = mouse.middle(event.value, time())
+                    elif event.matches(EV_KEY.BTN_LEFT):
+                        actions = mouse.left(event.value, time())
+                    elif event.matches(EV_KEY.BTN_RIGHT):
+                        actions = mouse.right(event.value)
+                    elif event.matches(EV_REL.REL_X):
+                        moved_x += event.value
+                        continue
+                    elif event.matches(EV_REL.REL_Y):
+                        moved_y += event.value
+                        continue
+                    else:
+                        continue
+                    for action in actions:
+                        handle(action)
+                        mouse.set_active(dialpad)
+
+            for action in mouse.tick(time()):
+                handle(action)
+
+            if not dialpad:
+                center_pressed = False
+
+            # The heading starts afresh when the dial turns on and after
+            # entering or leaving a function or a list.
+            context = (
+                bool(dialpad), bool(center_activated), submenu,
+                title if center_activated else None,
+            )
+            if context != last_context:
+                last_context = context
+                centre_point()
+            if motion and dialpad and (moved_x or moved_y):
+                pointer.move(moved_x, moved_y)
+                follow_motion()
+
+            # The overlay stays up while the dial is on.
+            if bool(dialpad) != touching_sent:
+                touching_sent = bool(dialpad)
+                if overlay_enabled():
+                    send_to_socket({"touching": touching_sent})
+
+            # Grab after the toggle key is released: the desktop saw it go
+            # down and must see it go up (and the other way round).
+            if bool(dialpad) != mouse_grabbed and not mouse.toggle_down:
+                set_mouse_grab(bool(dialpad))
+
+            # Configuration and focus changes wait for the centre button.
+            process_pending_driver_updates(gesture_idle=not mouse.center_held)
+
+        except OSError as error:
+            log.warning("Lost the mouse (%s); looking for it again", error)
+            close_mouse()
+            mouse.set_active(False)
+            mouse.toggle_down = False
+            center_pressed = False
+            next_search = time() + MOUSE_RETRY_SECONDS
+        except Exception:
+            log.exception("Error in listen_mouse_events")
             break
 
 def config_dir_event(name):
@@ -3225,7 +3628,9 @@ def cleanup():
         except Exception:
             pass
 
-        fd_t.close()
+        if fd_t is not None:
+            fd_t.close()
+        close_mouse()
 
         if display_wayland:
             display_wayland.disconnect()
@@ -3579,15 +3984,18 @@ try:
     while not keymap_loaded:
         sleep(0.5)
 
-    if emulation:
-        # The emulated dial takes the whole touchpad: never start with it on,
-        # and give the pointer back if the driver stopped while it was on.
+    if emulation or mouse_mode:
+        # The emulated dial takes the whole touchpad and the mouse dial the
+        # mouse: never start with it on, and give the pointer back if the
+        # driver stopped while it was on.
         config_lock.acquire()
         read_config_file()
         config_set(CONFIG_ENABLED, False, already_has_lock=True)
         config_lock.release()
-        set_touchpad_prop_send_events(1)
-        # A stopped service must not leave the touchpad switched off.
+        if emulation:
+            set_touchpad_prop_send_events(1)
+        # A stopped service must not leave the touchpad switched off or the
+        # mouse grabbed.
         signal.signal(signal.SIGTERM, lambda _signal, _frame: sys.exit(0))
 
     # Load config values
@@ -3649,8 +4057,11 @@ try:
     threads.append(t)
     t.start()
 
-    # The touchpad listener runs on the main thread
-    listen_touchpad_events()
+    # The touchpad (or mouse) listener runs on the main thread
+    if mouse_mode:
+        listen_mouse_events()
+    else:
+        listen_touchpad_events()
 except Exception:
     log.exception("Listening touchpad events unexpectedly failed")
 finally:
