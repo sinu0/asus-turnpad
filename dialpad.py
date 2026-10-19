@@ -48,10 +48,24 @@ import launch
 import layout_detect
 from dir_watch import DirectoryWatcher
 from mouse_dial import MouseDial, MousePointer, find_mouse
+from spacemouse_dial import ButtonMachine, ListStepper, SpaceCap
+from spacenav_client import (
+    EVMASK_RAWAXIS,
+    EVMASK_RAWBUTTON,
+    UEV_MOTION,
+    UEV_PRESS,
+    UEV_RAWAXIS,
+    UEV_RAWBUTTON,
+    UEV_RELEASE,
+    RestoreFile,
+    SpacenavClient,
+    socket_candidates,
+)
 from desktop import keyboard_layout
 from backlight import KeyboardBacklight, commands_for_level
 from config.identity import SLUG, socket_path
 from desktop.active_window import ActiveWindow, Context as ActiveWindowContext
+from desktop import kwin_script
 from dial_gesture import (
     CalibrationSession,
     DEFAULT_HYSTERESIS,
@@ -72,12 +86,22 @@ except Exception:
     DBUS_SERVICE_AVAILABLE = False
 
 try:
-    from config.schema import CONFIG_FILE, MacroStep, StepType, config_from_text
+    from config.schema import CONFIG_DIR, CONFIG_FILE, MacroStep, StepType, config_from_text
+    from config.schema import MODIFIER_KEYS as SCHEMA_MODIFIER_KEYS
+    from config.schema import spacemouse_binds, spacemouse_buttons_for, spacemouse_hold_keys
+    from config.schema import spacemouse_macros, spacemouse_modifier_keys
     from config.legacy_adapter import META_KEY, shortcuts_from_config
     from config.runtime import MacroExecutionError, MacroExecutor
     CONFIG_APP_AVAILABLE = True
 except Exception:
+    CONFIG_DIR = None
     CONFIG_FILE = None
+    SCHEMA_MODIFIER_KEYS = None
+    spacemouse_binds = None
+    spacemouse_buttons_for = None
+    spacemouse_hold_keys = None
+    spacemouse_macros = None
+    spacemouse_modifier_keys = None
     MacroStep = None
     StepType = None
     config_from_text = None
@@ -88,6 +112,10 @@ except Exception:
     CONFIG_APP_AVAILABLE = False
 
 SOCKET_PATH = socket_path()
+# What a SpaceMouse run changed in spacenavd (muted, hidden buttons), kept so a
+# crash can be undone at the next start; an unused button index to hide buttons on.
+SPACENAV_RESTORE_FILE = str(CONFIG_DIR / "spacenav-restore.json") if CONFIG_DIR is not None else ""
+SPACENAV_UNUSED_BUTTON = 63
 sock = None
 dbus_service = None
 driver_state_lock = threading.RLock()
@@ -99,6 +127,8 @@ pending_gui_config = None
 # The applied config.json (first characters of its SHA-256), why a newer one
 # was not applied, and whether one waits for the finger to lift (GetStatus).
 config_status = {"revision": "", "error": "", "pending": False}
+# The mouse dial's and SpaceMouse's sources (listen_input_sources), for GetStatus and cleanup().
+input_sources = []
 # Guided calibration: requested over D-Bus, run on the touch thread.
 pending_calibration = None
 calibration = None
@@ -184,8 +214,8 @@ def process_pending_driver_updates(gesture_idle=True):
 def on_dbus_start_calibration():
     global pending_calibration
 
-    # An emulated dial has no printed ring to trace, a mouse no touchpad.
-    if emulation or mouse_mode:
+    # An emulated dial has no printed ring to trace, a mouse or SpaceMouse no touchpad.
+    if emulation or touchpad_free:
         return False
     with driver_state_lock:
         pending_calibration = "start"
@@ -285,11 +315,52 @@ def get_dbus_status():
         "emulation": bool(emulation),
         "mouse": bool(mouse_mode),
         "mouse_device": getattr(globals().get("mouse_device"), "name", "") or "",
+        "spacemouse": any(source.name == "spacemouse" and source.connected for source in input_sources),
+        "spacemouse_device": next(
+            (source.device_name for source in input_sources if source.name == "spacemouse" and source.connected), ""
+        ),
         "touchpad": touchpad_name or "",
         "config_revision": config_state["revision"],
         "config_error": config_state["error"],
         "config_pending": config_state["pending"],
     }
+
+# KDE Plasma: a KWin script pushes the focused application (desktop/kwin_script.py).
+kde_script = None
+kde_script_closed = False
+
+def start_kwin_script():
+    """Load the KWin script that reports the focused application (Plasma on
+    Wayland only: on KDE X11 the x11 polling backend answers with the binary
+    path, and a second source with desktop ids would fight it)."""
+    global kde_script
+
+    if not kwin_script.is_kde() or xdg_session_type != "wayland" or kde_script_closed:
+        return
+    if kwin_script.script_path() is None:
+        log.warning("No XDG_RUNTIME_DIR for the KWin script; the focused application is polled instead")
+        return
+    try:
+        script = kwin_script.KWinScript(kwin_script.GioBus())
+        script.load()
+    except Exception as error:
+        log.warning("Could not load the KWin script for the focused application (%s); polling instead", error)
+        return
+    kde_script = script
+    if kde_script_closed:
+        # The driver was stopped while the script was loading.
+        stop_kwin_script()
+
+def stop_kwin_script():
+    global kde_script, kde_script_closed
+
+    kde_script_closed = True
+    script, kde_script = kde_script, None
+    if script is not None:
+        try:
+            script.unload()
+        except Exception as error:
+            log.debug("Could not unload the KWin script: %s", error)
 
 def init_dbus():
     global dbus_service
@@ -316,8 +387,12 @@ def init_dbus():
         try:
             if not service.start():
                 log.debug("DialPad D-Bus service is unavailable")
+                return
         except Exception:
             log.exception("Failed to start the DialPad D-Bus service")
+            return
+        # The service owns its name now: KWin's script can report to it.
+        start_kwin_script()
 
     try:
         threading.Thread(
@@ -562,6 +637,8 @@ def apply_gui_settings():
         log.info("DialPad emulation %s after the driver restarts", "starts" if gui_config.emulation.enabled else "ends")
     if gui_config.mouse.enabled != mouse_mode:
         log.info("Mouse dial %s after the driver restarts", "starts" if gui_config.mouse.enabled else "ends")
+    if gui_config.spacemouse.enabled != spacemouse_wanted:
+        log.info("SpaceMouse mode %s after the driver restarts", "starts" if gui_config.spacemouse.enabled else "ends")
 
     if emulation:
         # The emulated dial follows the touchpad, not a calibrated geometry.
@@ -610,6 +687,15 @@ load_gui_shortcuts()
 # No touchpad, no DialPad hardware. Read once; the settings app restarts the
 # driver when it changes.
 mouse_mode = bool(gui_config is not None and gui_config.mouse.enabled)
+# SpaceMouse mode (config.json "spacemouse"): a 3Dconnexion SpaceMouse through
+# spacenavd. It works alone (no touchpad) or together with the mouse dial; with
+# a touchpad mode (a DialPad found, or the emulation) it is not supported yet.
+spacemouse_wanted = bool(gui_config is not None and gui_config.spacemouse.enabled)
+spacemouse_alone = spacemouse_wanted and not mouse_mode and not (gui_config.emulation.enabled)
+# Without a touchpad to find, this is decided after the search below.
+touchpad_optional = mouse_mode or spacemouse_alone
+touchpad_free = mouse_mode
+spacemouse_mode = spacemouse_wanted and mouse_mode
 # DialPad emulation (config.json "emulation") for touchpads without a DialPad:
 # any touchpad, no commands to its hardware (no light, nothing to unlock), the
 # whole touchpad is the dial while it is on. Read once likewise; the mouse dial
@@ -624,6 +710,8 @@ if mouse_mode:
         log.warning("Mouse dial and DialPad emulation are both on; the mouse dial wins")
 elif emulation:
     log.info("DialPad emulation: the whole touchpad is the dial while it is on")
+if spacemouse_wanted and not mouse_mode and gui_config.emulation.enabled:
+    log.warning("SpaceMouse mode is not supported together with Touchpad mode yet; ignoring it")
 
 # Figure out devices from devices file
 touchpad: Optional[str] = None
@@ -709,10 +797,10 @@ while try_times > 0:
 
     # The mouse dial needs no touchpad (the mouse is looked for later, and
     # again whenever it is gone).
-    if (touchpad_detected != 2 and not mouse_mode) or keyboard_detected != 2:
+    if (touchpad_detected != 2 and not touchpad_optional) or keyboard_detected != 2:
         try_times -= 1
         if try_times == 0:
-            if mouse_mode:
+            if touchpad_optional:
                 # Not an error without a touchpad, and nothing to dump.
                 if keyboard_detected != 2:
                     log.info("No ASUS keyboard; Ctrl/Shift/Alt variants of functions need it")
@@ -721,10 +809,10 @@ while try_times > 0:
                     lines = f.readlines()
                     for line in lines:
                         log.error(line)
-            if keyboard_detected != 2 and not mouse_mode:
+            if keyboard_detected != 2 and not touchpad_optional:
                 log.error("Can't find keyboard (code: %s)", keyboard_detected)
                 # keyboard is optional, no sys.exit(1)!
-            if touchpad_detected != 2 and not mouse_mode:
+            if touchpad_detected != 2 and not touchpad_optional:
                 log.error("Can't find touchpad (code: %s)", touchpad_detected)
                 if not emulation:
                     log.error("No touchpad with a DialPad found; other touchpads need Driver > Touchpad mode in the settings app")
@@ -738,8 +826,18 @@ while try_times > 0:
 
     sleep(try_sleep)
 
-# The emulation and the mouse dial send nothing to the touchpad: no hidraw, no I2C bus.
-if emulation or mouse_mode:
+# SpaceMouse mode alone runs when there is no DialPad touchpad; with one the
+# touchpad mode wins.
+if spacemouse_alone:
+    if touchpad_detected == 2:
+        log.warning("SpaceMouse mode is not supported together with DialPad mode yet (a DialPad touchpad was found); ignoring it")
+    else:
+        touchpad_free = True
+        spacemouse_mode = True
+        log.info("SpaceMouse mode: no touchpad needed")
+
+# The emulation, the mouse dial and the SpaceMouse send nothing to the touchpad: no hidraw, no I2C bus.
+if emulation or touchpad_free:
     hidraw_path = None
 else:
     # Is the hidraw node of the touchpad usable? (preferred, I2C is a fallback)
@@ -807,8 +905,8 @@ config = configparser.ConfigParser()
 config_lock = threading.Lock()
 
 # Start monitoring the touchpad (the mouse dial has none: its device is opened
-# by listen_mouse_events())
-if mouse_mode:
+# by listen_input_sources())
+if touchpad_free:
     fd_t = None
     d_t = None
     abs_x = abs_y = None
@@ -1074,7 +1172,7 @@ def send_value_to_touchpad_via_hidraw(value):
 
 def send_value_to_touchpad(value):
     # A touchpad without a DialPad (or none at all) gets no DialPad commands.
-    if emulation or mouse_mode:
+    if emulation or touchpad_free:
         return True
     if send_value_to_touchpad_via_hidraw(value):
         return True
@@ -1190,6 +1288,13 @@ def enable_config_macro_capabilities(reset_udev=False):
                 scan_shortcuts(nested_value)
 
     scan_shortcuts(app_shortcuts)
+
+    # Keys of the SpaceMouse buttons' macros and modifiers.
+    config = globals().get("gui_config")
+    if config is not None and globals().get("spacemouse_macros") is not None:
+        for macro in spacemouse_macros(config):
+            process_macro(macro)
+        enable_macro_keys(sorted(spacemouse_modifier_keys(config) | spacemouse_hold_keys(config)))
 
     if reset_udev and udev and len(enabled_evdev_keys) > enabled_keys_count:
         # The action thread rebuilds the device: the dial keeps running
@@ -1381,7 +1486,8 @@ def release_scroll_modifiers(generation=None):
         if generation is not None and generation != scroll_modifier_generation:
             return
         keys, scroll_modifiers_held = scroll_modifiers_held, []
-        set_keys_held(keys, False)
+        # A key a SpaceMouse button still holds stays down.
+        set_keys_held([key for key in keys if key not in spacemouse_held_keys], False)
 
 def hold_scroll_modifiers(keys):
     """Keep ``keys`` pressed and postpone their release; True if newly pressed."""
@@ -1391,7 +1497,7 @@ def hold_scroll_modifiers(keys):
         generation = scroll_modifier_generation
         newly_pressed = False
         if keys != scroll_modifiers_held:
-            set_keys_held(scroll_modifiers_held, False)
+            set_keys_held([key for key in scroll_modifiers_held if key not in spacemouse_held_keys], False)
             set_keys_held(keys, True)
             scroll_modifiers_held = list(keys)
             newly_pressed = bool(keys)
@@ -2467,6 +2573,109 @@ def rotate_dial(direction):
     else:
         rotate_selected_function(direction)
 
+def go_back():
+    """One level back: out of a function or a list (the mouse's right button,
+    the SpaceMouse's back action); nothing in the plain menu."""
+    if multi_app_mode and (center_activated or submenu):
+        leave_function()
+        return True
+    return False
+
+def tap_center():
+    """A tap on the centre button, on what is highlighted (a SpaceMouse
+    button let go after tilting)."""
+    if not dialpad or not title:
+        return False
+    release_center(0.0, False)
+    show_menu_after_gesture()
+    return True
+
+def open_group_list(group_title=None):
+    """Open the list of a group of the current profile's menu (the first one by default)."""
+    if not (dialpad and multi_app_mode):
+        return False
+    groups = [entry for entry in (multi_app_mode_titles or []) if entry and is_group(entry)]
+    target = group_title if group_title in groups else (groups[0] if groups and not group_title else None)
+    if target is None:
+        return False
+    open_submenu(target)
+    return True
+
+def enter_named_function(function_title=None, slot=None):
+    """Enter a function of the current profile by name, or by its place in the
+    menu (``slot``, from 0; a group opens its list). Functions inside groups
+    are found too."""
+    global title
+
+    if not (dialpad and multi_app_mode):
+        return False
+    titles = [entry for entry in (multi_app_mode_titles or []) if entry]
+    if function_title is None:
+        if slot is None or slot >= len(titles):
+            return False
+        function_title = titles[slot]
+    if function_title in titles:
+        reset_center()
+        title = function_title
+        return select_multifunction_segment()
+    for group in titles:
+        items = group_settings(group).get("items") if is_group(group) else None
+        if items and function_title in items:
+            open_submenu(group, list(items).index(function_title))
+            title = function_title
+            return select_multifunction_segment()
+    return False
+
+def spacemouse_effective_buttons():
+    """The map in force: the global one with the current profile's buttons over it
+    (a profile's binding replaces the global one of that button, ``none`` included)."""
+    buttons = {}
+    if gui_config is not None and spacemouse_buttons_for is not None:
+        buttons.update(spacemouse_buttons_for(gui_config))
+    profile_buttons = profile_meta().get("spacemouse_buttons")
+    if isinstance(profile_buttons, dict):
+        buttons.update(profile_buttons)
+    return buttons
+
+def spacemouse_binding(index):
+    """The actions of a SpaceMouse button: the profile's, else the global map's."""
+    return spacemouse_effective_buttons().get(str(index))
+
+def spacemouse_action_keys(action):
+    """The virtual keyboard keys a modifier or key_hold action holds, in press order."""
+    names = []
+    if action.type == "modifier" and SCHEMA_MODIFIER_KEYS and action.modifier in SCHEMA_MODIFIER_KEYS:
+        names = SCHEMA_MODIFIER_KEYS[action.modifier][:1]
+    elif action.type == "key_hold":
+        names = action.keys or []
+    keys = []
+    for name in names:
+        key = getattr(EV_KEY, name, None) if isinstance(name, str) else None
+        if key is not None and getattr(key, "type", None) == EV_KEY and key not in keys:
+            keys.append(key)
+    return keys
+
+def run_spacemouse_action(action):
+    """Run one SpaceMouse action (a modifier is held by the input loop)."""
+    kind = action.type
+    if kind == "macro":
+        steps = action.steps()
+        if steps:
+            enqueue_action(lambda: execute_config_macro(steps))
+    elif kind == "dial":
+        toggle_top_right_icon(dialpad)
+    elif kind in ("group", "function"):
+        if not dialpad:
+            toggle_top_right_icon(dialpad)
+        if kind == "group":
+            open_group_list(action.group)
+        else:
+            enter_named_function(action.function, action.slot)
+    elif kind == "select":
+        tap_center()
+    elif kind == "back":
+        go_back()
+
 window_binary = None
 
 def update_touch_slots(slots, current_slot, event):
@@ -2901,66 +3110,229 @@ def open_mouse(key_code):
     log.info('Mouse dial: using "%s" (%s)', opened.name, node)
     return True
 
-def listen_mouse_events():
-    """The mouse dial's loop, on the main thread like the touch loop: the
-    toggle key switches the dial, the wheel turns it, the middle and left
-    buttons are the centre (left: select, middle: also hold to go back), the
-    right button goes back, and with config mouse.motion the direction the
-    mouse moves is the dial's angle (see MouseDial, MousePointer)."""
-    global last_event_time, title, center_activated, treshold
+class CenterGesture:
+    """The centre button of an input source (the mouse's middle or left
+    button, the SpaceMouse cap's push): a press counts when an entry is
+    highlighted, like a finger on the centre."""
 
-    title = None
-    center_activated = False
-    treshold = None
+    def __init__(self):
+        self.pressed = False
+        # Called after a release with whether it opened a group's list.
+        self.settled = []
 
-    DEBOUNCE_MS = 30
+    def press(self):
+        if title:
+            if overlay_enabled():
+                send_to_socket({"input": "center", "value": 1, "title": title})
+            self.pressed = True
+
+    def hold(self):
+        if self.pressed and multi_app_mode and (center_activated or submenu):
+            leave_function()
+
+    def release(self, duration, hold_fired):
+        if not self.pressed:
+            return
+        list_before = submenu
+        release_center(duration, hold_fired)
+        if overlay_enabled():
+            send_to_socket({"input": "center", "value": 0, "title": title})
+        self.pressed = False
+        show_menu_after_gesture()
+        opened_list = bool(submenu) and not list_before
+        for listener in self.settled:
+            listener(opened_list)
+
+    def reset(self):
+        self.pressed = False
+
+    def apply(self, action):
+        """Run a MouseDial centre action; False if it is not one."""
+        if action.kind == "center_press":
+            self.press()
+        elif action.kind == "center_hold":
+            self.hold()
+        elif action.kind == "center_release":
+            self.release(action.duration, action.hold_fired)
+        else:
+            return False
+        return True
+
+
+# Keys that SpaceMouse modifier buttons hold; the scroll steps' own holding of
+# Ctrl must not let go of them.
+spacemouse_held_keys = set()
+# The keys the SpaceMouse buttons want down (written on the input thread), and
+# the ones the action thread has pressed on the virtual keyboard for them.
+spacemouse_key_lock = threading.Lock()
+spacemouse_target_keys = []
+spacemouse_applied_keys = []
+
+def reconcile_spacemouse_keys():
+    """Press and release the virtual keyboard's keys until they are the keys the
+    buttons want. It always works from the newest wish, so jobs that run late,
+    twice or out of order (the overflow thread of a full action queue) still end
+    right and never leave a key stuck."""
+    with spacemouse_key_lock:
+        target = list(spacemouse_target_keys)
+        release = [key for key in spacemouse_applied_keys if key not in target]
+        press = [key for key in target if key not in spacemouse_applied_keys]
+        # A key scroll steps are holding too (zoom) stays down for them; they let go of it.
+        set_keys_held([key for key in release if key not in scroll_modifiers_held], False)
+        for key in release:
+            spacemouse_applied_keys.remove(key)
+        set_keys_held(press, True)
+        spacemouse_applied_keys.extend(press)
+
+def restore_spacenav_leftovers(client, restore):
+    """Undo what a run that was killed left in spacenavd: other programs muted
+    (sensitivity 0) or buttons hidden. The restore file says what it was."""
+    saved = restore.load()
+    if not saved or client.proto < 1:
+        return
+    sensitivity = saved.get("sensitivity")
+    if isinstance(sensitivity, (int, float)) and client.get_sensitivity() == 0.0:
+        client.set_sensitivity(float(sensitivity))
+        log.info("SpaceMouse: restored spacenavd's sensitivity %s", sensitivity)
+    for button, mapped in (saved.get("bnmap") or {}).items():
+        try:
+            client.set_button_map(int(button), int(mapped))
+        except (TypeError, ValueError):
+            pass
+    restore.clear()
+
+def restore_spacenav_at_start():
+    """At driver start, also with SpaceMouse mode off (it may have been on when
+    the driver died): a short, non-blocking visit to spacenavd if there is
+    something to give back. The file stays when spacenavd is not there."""
+    restore = RestoreFile(SPACENAV_RESTORE_FILE)
+    if not SPACENAV_RESTORE_FILE or restore.load() is None:
+        return
+    client = SpacenavClient()
+    try:
+        configured = gui_config.spacemouse.socket if gui_config is not None else ""
+        try:
+            with open("/etc/spnavrc", "r") as rc:
+                spnavrc = rc.read()
+        except OSError:
+            spnavrc = ""
+        if client.connect(socket_candidates(configured, os.environ, spnavrc)):
+            restore_spacenav_leftovers(client, restore)
+    except OSError as error:
+        log.warning("Could not give spacenavd back what the last run changed: %s", error)
+    finally:
+        client.close()
+
+class InputSource:
+    """One device that drives the dial from the main thread's select loop
+    (listen_input_sources): it finds its device, reads it and looks for it
+    again when it is gone."""
+
+    name = ""
+    # The file object to select on; None while the device is not there.
+    handle = None
+    center_held = False
+
+    def __init__(self, center):
+        self.center = center
+        self.next_search = 0
+        self.reported_missing = False
+
+    @property
+    def connected(self):
+        return self.handle is not None
+
+    def search(self, now):
+        """Look for the device, at most every MOUSE_RETRY_SECONDS."""
+
+    def process(self, readable, now):
+        """Handle what the device sent (readable: the files select found ready)."""
+
+    def sync(self, dial_on):
+        """Follow the dial's state (grab the mouse, mute other clients)."""
+
+    def context_changed(self):
+        """The dial turned on or off, or a function or list was entered or left."""
+
+    def lost(self, error):
+        """The device went away."""
+
+    def close(self):
+        """Let the device go, as it was."""
+
+
+class MouseSource(InputSource):
+    """The mouse: the toggle key switches the dial, the wheel turns it, the
+    middle and left buttons are the centre (left: select, middle: also hold to
+    go back), the right button goes back, and with config mouse.motion the
+    direction the mouse moves is the dial's angle (see MouseDial, MousePointer)."""
+
+    name = "mouse"
     # Same rule as the touch loop: at most one finger dot update per step.
     POINTER_STEP_DEGREES = 1
 
-    settings = gui_config.mouse if gui_config is not None else None
-    motion = bool(settings is not None and settings.motion)
-    toggle_key = mouse_toggle_key()
-    key_code = toggle_key.value
-    mouse = MouseDial(center_hold_time)
-    pointer = MousePointer(settings.motion_radius if settings is not None else 300)
-    rotation = RotationTracker(angle_hysteresis, DEBOUNCE_MS)
-    touching_sent = False
-    # A centre button went down on something it can act on (it needs a
-    # highlighted entry, like a finger on the centre).
-    center_pressed = False
-    last_slice = None
-    last_pointer_angle = None
-    # What the heading means: it starts again when this changes.
-    last_context = None
-    next_search = 0
-    reported_missing = False
+    def __init__(self, center):
+        super().__init__(center)
+        settings = gui_config.mouse if gui_config is not None else None
+        self.motion = bool(settings is not None and settings.motion)
+        self.toggle_key = mouse_toggle_key()
+        self.mouse = MouseDial(center_hold_time)
+        self.pointer = MousePointer(settings.motion_radius if settings is not None else 300)
+        self.rotation = RotationTracker(angle_hysteresis, 30)
+        self.last_slice = None
+        self.last_pointer_angle = None
+        self.reported_missing = False
+        log.info(
+            "Mouse dial: toggle key %s, motion %s",
+            self.toggle_key.name, "on" if self.motion else "off",
+        )
 
-    log.info(
-        "Listening to mouse events (toggle key %s, motion %s)...",
-        toggle_key.name, "on" if motion else "off",
-    )
+    @property
+    def handle(self):
+        return mouse_file if mouse_device is not None else None
 
-    def centre_point():
+    @property
+    def connected(self):
+        return mouse_device is not None
+
+    @property
+    def center_held(self):
+        return self.mouse.center_held
+
+    def search(self, now):
+        if now < self.next_search:
+            return
+        self.next_search = now + MOUSE_RETRY_SECONDS
+        if open_mouse(self.toggle_key.value):
+            self.reported_missing = False
+            self.mouse.set_active(dialpad)
+        elif not self.reported_missing:
+            self.reported_missing = True
+            log.warning(
+                'No mouse with %s and a wheel found%s; looking again every %d s',
+                self.toggle_key.name,
+                f' named "{gui_config.mouse.device}"' if gui_config.mouse.device else "",
+                MOUSE_RETRY_SECONDS,
+            )
+
+    def context_changed(self):
         """No heading yet (the hand has to travel again), no finger dot."""
-        nonlocal last_slice, last_pointer_angle
-
-        pointer.reset()
-        rotation.reset()
-        last_slice = None
-        if last_pointer_angle is not None:
-            last_pointer_angle = None
+        self.pointer.reset()
+        self.rotation.reset()
+        self.last_slice = None
+        if self.last_pointer_angle is not None:
+            self.last_pointer_angle = None
             send_details(pointer=-1)
 
-    def follow_motion():
+    def follow_motion(self):
         """The hand's heading as a finger's angle: the sector it points to, a
         list's highlight or the selected function's turning."""
-        nonlocal last_slice, last_pointer_angle
-
+        pointer, rotation = self.pointer, self.rotation
         if pointer.in_dead_zone:
             # Like a finger in the centre button.
             rotation.reset()
-            if last_pointer_angle is not None:
-                last_pointer_angle = None
+            if self.last_pointer_angle is not None:
+                self.last_pointer_angle = None
                 send_details(pointer=-1)
             return
         angle = pointer.angle()
@@ -2970,10 +3342,10 @@ def listen_mouse_events():
             # (In the menu a jump just picks the new sector.)
             rotation.reset()
         if show_pointer_enabled() and (
-            last_pointer_angle is None
-            or abs((angle - last_pointer_angle + 180) % 360 - 180) >= POINTER_STEP_DEGREES
+            self.last_pointer_angle is None
+            or abs((angle - self.last_pointer_angle + 180) % 360 - 180) >= self.POINTER_STEP_DEGREES
         ):
-            last_pointer_angle = angle
+            self.last_pointer_angle = angle
             send_details(pointer=round(angle, 1))
         if multi_app_mode and submenu and not center_activated:
             moved = rotation.update(angle, time(), max(2, SUBMENU_STEP_DEGREES / profile_float("sensitivity")))
@@ -2981,123 +3353,525 @@ def listen_mouse_events():
                 move_submenu_highlight(moved[0])
         elif multi_app_mode and not center_activated:
             slice_idx = slice_index(angle, max(len(multi_app_mode_titles or []), slices_minimum_count))
-            if slice_idx != last_slice:
-                last_slice = slice_idx
+            if slice_idx != self.last_slice:
+                self.last_slice = slice_idx
                 highlight_menu_slice(slice_idx)
         else:
             turn_selected_function(rotation, angle)
 
-    def press_center():
-        nonlocal center_pressed
-
-        if title:
-            if overlay_enabled():
-                send_to_socket({"input": "center", "value": 1, "title": title})
-            center_pressed = True
-
-    def handle(action):
-        nonlocal center_pressed
-
+    def handle_action(self, action):
+        if self.center.apply(action):
+            return
         if action.kind == "toggle":
             toggle_top_right_icon(dialpad)
-            mouse.set_active(dialpad)
+            self.mouse.set_active(dialpad)
         elif action.kind == "rotate":
             rotate_dial(action.direction)
-        elif action.kind == "center_press":
-            press_center()
-        elif action.kind == "center_hold":
-            if center_pressed and multi_app_mode and (center_activated or submenu):
-                leave_function()
-        elif action.kind == "center_release":
-            if center_pressed:
-                release_center(action.duration, action.hold_fired)
-                if overlay_enabled():
-                    send_to_socket({"input": "center", "value": 0, "title": title})
-                center_pressed = False
-                show_menu_after_gesture()
         elif action.kind == "back":
-            if multi_app_mode and (center_activated or submenu):
-                leave_function()
+            go_back()
+
+    def process(self, readable, now):
+        global last_event_time
+
+        mouse = self.mouse
+        mouse.hold_time = center_hold_time
+        # The dial can also be switched over D-Bus or by the inactivity timer.
+        mouse.set_active(dialpad)
+
+        moved_x = moved_y = 0
+        if self.handle in readable:
+            events = []
+            try:
+                for event in mouse_device.events():
+                    events.append(event)
+            except device.EventsDroppedException:
+                log.debug("Mouse events dropped; resynchronising")
+                for _ in mouse_device.sync():
+                    pass
+            for event in events:
+                last_event_time = time()
+                if event.matches(self.toggle_key):
+                    actions = mouse.toggle_key(event.value)
+                elif event.matches(EV_REL.REL_WHEEL):
+                    # REL_WHEEL_HI_RES is ignored: one notch, one step.
+                    actions = mouse.wheel(event.value)
+                elif event.matches(EV_KEY.BTN_MIDDLE):
+                    actions = mouse.middle(event.value, time())
+                elif event.matches(EV_KEY.BTN_LEFT):
+                    actions = mouse.left(event.value, time())
+                elif event.matches(EV_KEY.BTN_RIGHT):
+                    actions = mouse.right(event.value)
+                elif event.matches(EV_REL.REL_X):
+                    moved_x += event.value
+                    continue
+                elif event.matches(EV_REL.REL_Y):
+                    moved_y += event.value
+                    continue
+                else:
+                    continue
+                for action in actions:
+                    self.handle_action(action)
+                    mouse.set_active(dialpad)
+
+        for action in mouse.tick(time()):
+            self.handle_action(action)
+
+        if self.motion and dialpad and (moved_x or moved_y):
+            self.pointer.move(moved_x, moved_y)
+            self.follow_motion()
+
+    def sync(self, dial_on):
+        # Grab after the toggle key is released: the desktop saw it go
+        # down and must see it go up (and the other way round).
+        if dial_on != mouse_grabbed and not self.mouse.toggle_down:
+            set_mouse_grab(dial_on)
+
+    def lost(self, error):
+        log.warning("Lost the mouse (%s); looking for it again", error)
+        close_mouse()
+        self.mouse.set_active(False)
+        self.mouse.toggle_down = False
+        self.center.reset()
+        self.next_search = time() + MOUSE_RETRY_SECONDS
+
+    def close(self):
+        close_mouse()
+
+
+class SpaceMouseSource(InputSource):
+    """A 3Dconnexion SpaceMouse through spacenavd (spacenav_client.py): its
+    raw buttons and axes arrive whatever spacenavd's configuration is. Buttons
+    run their actions (ButtonMachine), tilt picks, twist turns, a push on the
+    cap is the centre button (SpaceCap)."""
+
+    name = "spacemouse"
+
+    def __init__(self, center):
+        super().__init__(center)
+        settings = gui_config.spacemouse
+        self.settings = settings
+        self.client = SpacenavClient()
+        self.cap = SpaceCap(
+            settings.axis_max, settings.tilt_axes, settings.tilt_invert, settings.twist_axis,
+            settings.twist_invert, settings.twist_speed, settings.push_axis, settings.push_invert,
+        )
+        self.buttons = ButtonMachine(settings.hold_ms)
+        self.push = MouseDial(center_hold_time)
+        self.rotation = RotationTracker(angle_hysteresis, 30)
+        self.stepper = ListStepper()
+        self.restore = RestoreFile(SPACENAV_RESTORE_FILE)
+        self.device_name = ""
+        self.muted = False
+        self.saved_sensitivity = None
+        self.hidden = {}
+        self.held_keys = []
+        # How many buttons hold each key down right now.
+        self.held_counts = {}
+        self.hidden_for = None
+        # Buttons physically down now, and the ones whose mapping waits for their release.
+        self.physical_down = set()
+        self.deferred_buttons = set()
+        self.last_slice = None
+        self.last_pointer_angle = None
+        center.settled.append(self.center_settled)
+        log.info("SpaceMouse mode: looking for spacenavd")
+
+    def center_settled(self, opened_list):
+        """A push on the cap chose something: the button that opened the menu has
+        nothing left to select (it would select twice, or not close the dial).
+        A group's list that just opened keeps its opener."""
+        if not opened_list:
+            self.buttons.clear_opener()
+
+    @property
+    def handle(self):
+        return self.client.sock
+
+    @property
+    def connected(self):
+        return self.client.connected
+
+    @property
+    def center_held(self):
+        return self.push.center_held or self.buttons.gesture_active
+
+    def search(self, now):
+        if now < self.next_search:
+            return
+        self.next_search = now + MOUSE_RETRY_SECONDS
+        try:
+            with open("/etc/spnavrc", "r") as rc:
+                spnavrc = rc.read()
+        except OSError:
+            spnavrc = ""
+        if not self.client.connect(socket_candidates(self.settings.socket, os.environ, spnavrc)):
+            if not self.reported_missing:
+                self.reported_missing = True
+                log.warning("spacenavd is not reachable; looking again every %d s", MOUSE_RETRY_SECONDS)
+            return
+        self.reported_missing = False
+        client = self.client
+        self.cap.reset()
+        self.buttons = ButtonMachine(self.settings.hold_ms)
+        self.push.set_active(False)
+        try:
+            self.negotiate()
+        except OSError as error:
+            # The daemon went away right after connecting: not a reason to stop the driver.
+            self.lost(error)
+            return
+        log.info("SpaceMouse: connected to spacenavd (protocol %d)%s", client.proto,
+                 f', device "{self.device_name}"' if self.device_name else "")
+
+    def negotiate(self):
+        """Requests after connecting; OSError when the daemon is gone."""
+        client = self.client
+        self.give_back_leftovers()
+        if client.proto >= 1:
+            client.send_name("Turnpad")
+            if not client.set_evmask(EVMASK_RAWAXIS | EVMASK_RAWBUTTON):
+                log.warning("spacenavd refused the raw event mask; the SpaceMouse may not work")
+            self.device_name = " ".join((client.device_name() or "").split())
+            self.hidden_for = None  # sync() hides what the profile binds
+        else:
+            self.device_name = ""
+            log.warning(
+                "spacenavd speaks protocol 0 (old): no raw events, so spacenavd's own button "
+                "mapping and dead zones apply, and other programs are not muted"
+            )
+
+    def give_back_leftovers(self):
+        """A previous run that crashed may have left other programs muted or buttons hidden."""
+        restore_spacenav_leftovers(self.client, self.restore)
+
+    def sync_hidden_buttons(self):
+        """With hide_buttons: map exactly the buttons the current profile binds to an
+        unused one (other programs do not see them; Turnpad still gets them as
+        raw buttons) and give the others back. Called when the profile or the
+        configuration changes."""
+        if self.client.proto < 1 or gui_config is None:
+            return
+        wanted = set()
+        if gui_config.spacemouse.hide_buttons:
+            wanted = {int(key) for key, binding in spacemouse_effective_buttons().items() if spacemouse_binds(binding)}
+        # A button that is down now keeps its mapping until it is up: changing it
+        # mid-press would leave the press or the release with the wrong client.
+        self.deferred_buttons = {
+            button for button in (set(self.hidden) ^ wanted) if button in self.physical_down
+        }
+        for button in sorted(set(self.hidden) - wanted - self.deferred_buttons):
+            if self.client.set_button_map(button, self.hidden[button]):
+                del self.hidden[button]
+        for button in sorted(wanted - set(self.hidden) - self.deferred_buttons):
+            mapped = self.client.get_button_map(button)
+            if mapped is None:
+                continue
+            if mapped == SPACENAV_UNUSED_BUTTON:
+                # Already hidden (by a run that left it so): its own button is what to give back.
+                mapped = button
+            # The original goes into the restore file before the mapping changes.
+            self.hidden[button] = mapped
+            self.save_restore()
+            if not self.client.set_button_map(button, SPACENAV_UNUSED_BUTTON):
+                del self.hidden[button]
+        self.save_restore()
+
+    def save_restore(self):
+        data = {}
+        if self.muted and self.saved_sensitivity is not None:
+            data["sensitivity"] = self.saved_sensitivity
+        if self.hidden:
+            data["bnmap"] = {str(button): mapped for button, mapped in self.hidden.items()}
+        if data:
+            self.restore.save(data)
+        else:
+            self.restore.clear()
+
+    def mute(self):
+        """Silence the other spacenavd clients while the dial is on (global sensitivity 0)."""
+        sensitivity = self.client.get_sensitivity()
+        if sensitivity is None:
+            return
+        self.saved_sensitivity = sensitivity
+        self.muted = True
+        self.save_restore()
+        self.client.set_sensitivity(0.0)
+
+    def unmute(self):
+        if self.saved_sensitivity is not None:
+            self.client.set_sensitivity(self.saved_sensitivity)
+        self.muted = False
+        self.saved_sensitivity = None
+        self.save_restore()
+
+    def context_changed(self):
+        self.rotation.reset()
+        self.stepper.reset()
+        self.last_slice = None
+        if self.last_pointer_angle is not None:
+            self.last_pointer_angle = None
+            send_details(pointer=-1)
+
+    def hold_key(self, action, pressed):
+        """Hold or release what a modifier or key_hold action keeps down. A key
+        that two buttons hold goes down with the first and up with the last."""
+        for key in spacemouse_action_keys(action):
+            count = self.held_counts.get(key, 0)
+            if pressed:
+                self.held_counts[key] = count + 1
+            elif count > 1:
+                self.held_counts[key] = count - 1
+            else:
+                self.held_counts.pop(key, None)
+        self.want_keys()
+
+    def want_keys(self):
+        """Tell the action thread which keys the buttons hold now."""
+        self.held_keys = list(self.held_counts)
+        with spacemouse_key_lock:
+            spacemouse_target_keys[:] = self.held_keys
+        spacemouse_held_keys.intersection_update(self.held_keys)
+        spacemouse_held_keys.update(self.held_keys)
+        enqueue_action(reconcile_spacemouse_keys, required=True)
+
+    def run_buttons(self, actions):
+        for item in actions:
+            if item.kind == "action":
+                run_spacemouse_action(item.action)
+                if item.action.type in ("select", "back"):
+                    self.buttons.clear_opener()
+            elif item.kind == "hold_down":
+                self.hold_key(item.action, True)
+            elif item.kind == "hold_up":
+                self.hold_key(item.action, False)
+            elif item.kind == "select":
+                tap_center()
+            elif item.kind == "close":
+                if dialpad:
+                    toggle_top_right_icon(dialpad)
+
+    def button(self, index, pressed, now):
+        global last_event_time
+
+        last_event_time = time()
+        dial_on = bool(dialpad)
+        if pressed:
+            self.physical_down.add(index)
+        else:
+            self.physical_down.discard(index)
+            if index in self.deferred_buttons:
+                # A mapping change that waited for this button to come up.
+                self.hidden_for = None
+        if pressed:
+            binding = spacemouse_binding(index)
+            if binding is None:
+                return
+            self.run_buttons(self.buttons.press(index, now, binding, dial_on))
+        else:
+            self.run_buttons(self.buttons.release(index, now, dial_on))
+
+    def axis(self, index, value, now):
+        change = self.cap.set_axis(index, value)
+        if change == "push":
+            actions = self.push.middle(1, now)
+        elif change == "release":
+            actions = self.push.middle(0, now)
+        else:
+            return
+        for action in actions:
+            self.center.apply(action)
+
+    def follow_cap(self, now):
+        """Tilt and twist as a finger's angle would drive the dial."""
+        global last_event_time
+
+        cap, rotation = self.cap, self.rotation
+        angle = cap.tilt_angle()
+        if angle is None:
+            if self.last_pointer_angle is not None:
+                self.last_pointer_angle = None
+                send_details(pointer=-1)
+        else:
+            last_event_time = time()
+            if show_pointer_enabled() and (
+                self.last_pointer_angle is None
+                or abs((angle - self.last_pointer_angle + 180) % 360 - 180) >= 1
+            ):
+                self.last_pointer_angle = angle
+                send_details(pointer=round(angle, 1))
+
+        in_menu = multi_app_mode and not center_activated
+        if in_menu and submenu:
+            direction, fraction = cap.list_direction()
+            step = self.stepper.update(direction, fraction, now)
+            if step and move_submenu_highlight("clockwise" if step > 0 else "counterclockwise") and title:
+                self.buttons.note_highlight()
+        elif in_menu:
+            self.stepper.reset()
+            if angle is not None:
+                slice_idx = slice_index(angle, max(len(multi_app_mode_titles or []), slices_minimum_count))
+                if slice_idx != self.last_slice:
+                    self.last_slice = slice_idx
+                    highlight_menu_slice(slice_idx)
+                    if title:
+                        self.buttons.note_highlight()
+            else:
+                # Back in the dead zone: tilting to the same sector again highlights it again.
+                self.last_slice = None
+
+        if cap.tick(now):
+            last_event_time = time()
+            rotation.hysteresis = angle_hysteresis
+            if in_menu:
+                moved = rotation.update(cap.twist_angle, now, max(2, SUBMENU_STEP_DEGREES / profile_float("sensitivity")))
+                if moved is not None:
+                    rotate_dial(moved[0])
+                    # The twist moved the highlight: a tilt to the sector it left must act.
+                    self.last_slice = None
+                    if title:
+                        self.buttons.note_highlight()
+            else:
+                turn_selected_function(rotation, cap.twist_angle)
+        else:
+            rotation.reset()
+
+    def process(self, readable, now):
+        self.push.hold_time = center_hold_time
+        self.push.set_active(dialpad)
+        proto0 = self.client.proto < 1
+        for event in self.client.read_events():
+            if event.type == UEV_RAWAXIS:
+                self.axis(event.data[0], event.data[1], now)
+            elif event.type == UEV_RAWBUTTON:
+                self.button(event.data[0], bool(event.data[1]), now)
+            elif proto0 and event.type in (UEV_PRESS, UEV_RELEASE):
+                self.button(event.data[0], event.type == UEV_PRESS, now)
+            elif proto0 and event.type == UEV_MOTION:
+                for axis_index in range(6):
+                    self.axis(axis_index, event.data[axis_index], now)
+        self.run_buttons(self.buttons.tick(now, bool(dialpad)))
+        if dialpad:
+            self.follow_cap(now)
+        for action in self.push.tick(now):
+            self.center.apply(action)
+
+    def sync(self, dial_on):
+        if not dial_on:
+            self.buttons.dial_off()
+        # The profile (focus) or the configuration changed: hide what it binds.
+        buttons_key = (app_name, id(gui_config), id(profile_meta().get("spacemouse_buttons")))
+        if buttons_key != self.hidden_for:
+            self.hidden_for = buttons_key
+            self.sync_hidden_buttons()
+        if self.client.proto >= 1 and self.settings.mute_others:
+            if dial_on and not self.muted:
+                self.mute()
+            elif not dial_on and self.muted:
+                self.unmute()
+
+    def release_keys(self, queued=False):
+        """Let go of the modifier keys the buttons hold. ``queued``: through the
+        action thread, after the presses it may still have waiting."""
+        self.held_counts = {}
+        self.want_keys()
+        if not queued:
+            reconcile_spacemouse_keys()
+
+    def lost(self, error):
+        log.warning("Lost spacenavd (%s); looking for it again", error)
+        self.release_keys(queued=True)
+        self.buttons.release_all()
+        self.client.close()
+        self.muted = False
+        self.saved_sensitivity = None
+        self.hidden = {}
+        self.hidden_for = None
+        self.held_counts = {}
+        self.physical_down = set()
+        self.deferred_buttons = set()
+        self.push.set_active(False)
+        self.center.reset()
+        self.next_search = time() + MOUSE_RETRY_SECONDS
+
+    def close(self):
+        self.release_keys()
+        if self.client.connected and self.client.proto >= 1:
+            try:
+                if self.muted:
+                    self.unmute()
+                # What cannot be given back stays in the restore file for the next start.
+                self.hidden = {
+                    button: mapped for button, mapped in self.hidden.items()
+                    if not self.client.set_button_map(button, mapped)
+                }
+                self.save_restore()
+            except OSError:
+                pass
+        self.client.close()
+
+
+def listen_input_sources():
+    """The input loop of the mouse dial and the SpaceMouse mode, on the main
+    thread like the touch loop: one select over the devices that are there.
+    Each source finds its device again when it is unplugged or spacenavd
+    restarts."""
+    global last_event_time, title, center_activated, treshold
+
+    title = None
+    center_activated = False
+    treshold = None
+
+    center = CenterGesture()
+    sources = input_sources
+    sources.clear()
+    if mouse_mode:
+        sources.append(MouseSource(center))
+    if spacemouse_mode:
+        sources.append(SpaceMouseSource(center))
+    touching_sent = False
+    # What the heading or the highlight means: it starts again when this changes.
+    last_context = None
 
     while not stop_threads:
         try:
-            if mouse_device is None:
+            now = time()
+            for source in sources:
+                if not source.connected:
+                    try:
+                        source.search(now)
+                    except OSError as error:
+                        source.lost(error)
+
+            handles = [source.handle for source in sources if source.connected]
+            if handles:
+                readable, _, _ = select.select(handles, [], [], MOUSE_POLL_SECONDS)
+            else:
                 # Updates from D-Bus (focus, configuration, Toggle) still apply.
-                process_pending_driver_updates()
-                if time() >= next_search:
-                    next_search = time() + MOUSE_RETRY_SECONDS
-                    if open_mouse(key_code):
-                        reported_missing = False
-                    elif not reported_missing:
-                        reported_missing = True
-                        log.warning(
-                            'No mouse with %s and a wheel found%s; looking again every %d s',
-                            toggle_key.name,
-                            f' named "{gui_config.mouse.device}"' if gui_config.mouse.device else "",
-                            MOUSE_RETRY_SECONDS,
-                        )
                 sleep(MOUSE_POLL_SECONDS)
-                continue
+                readable = []
 
-            readable, _, _ = select.select([mouse_file], [], [], MOUSE_POLL_SECONDS)
-
-            mouse.hold_time = center_hold_time
-            # The dial can also be switched over D-Bus or by the inactivity timer.
-            mouse.set_active(dialpad)
-
-            moved_x = moved_y = 0
-            if readable:
-                events = []
+            now = time()
+            for source in sources:
+                if not source.connected:
+                    continue
                 try:
-                    for event in mouse_device.events():
-                        events.append(event)
-                except device.EventsDroppedException:
-                    log.debug("Mouse events dropped; resynchronising")
-                    for _ in mouse_device.sync():
-                        pass
-                for event in events:
-                    last_event_time = time()
-                    if event.matches(toggle_key):
-                        actions = mouse.toggle_key(event.value)
-                    elif event.matches(EV_REL.REL_WHEEL):
-                        # REL_WHEEL_HI_RES is ignored: one notch, one step.
-                        actions = mouse.wheel(event.value)
-                    elif event.matches(EV_KEY.BTN_MIDDLE):
-                        actions = mouse.middle(event.value, time())
-                    elif event.matches(EV_KEY.BTN_LEFT):
-                        actions = mouse.left(event.value, time())
-                    elif event.matches(EV_KEY.BTN_RIGHT):
-                        actions = mouse.right(event.value)
-                    elif event.matches(EV_REL.REL_X):
-                        moved_x += event.value
-                        continue
-                    elif event.matches(EV_REL.REL_Y):
-                        moved_y += event.value
-                        continue
-                    else:
-                        continue
-                    for action in actions:
-                        handle(action)
-                        mouse.set_active(dialpad)
-
-            for action in mouse.tick(time()):
-                handle(action)
+                    source.process(readable, now)
+                except OSError as error:
+                    source.lost(error)
 
             if not dialpad:
-                center_pressed = False
+                center.reset()
 
-            # The heading starts afresh when the dial turns on and after
-            # entering or leaving a function or a list.
+            # A fresh start when the dial turns on and after entering or
+            # leaving a function or a list.
             context = (
                 bool(dialpad), bool(center_activated), submenu,
                 title if center_activated else None,
             )
             if context != last_context:
                 last_context = context
-                centre_point()
-            if motion and dialpad and (moved_x or moved_y):
-                pointer.move(moved_x, moved_y)
-                follow_motion()
+                for source in sources:
+                    source.context_changed()
 
             # The overlay stays up while the dial is on.
             if bool(dialpad) != touching_sent:
@@ -3105,23 +3879,18 @@ def listen_mouse_events():
                 if overlay_enabled():
                     send_to_socket({"touching": touching_sent})
 
-            # Grab after the toggle key is released: the desktop saw it go
-            # down and must see it go up (and the other way round).
-            if bool(dialpad) != mouse_grabbed and not mouse.toggle_down:
-                set_mouse_grab(bool(dialpad))
+            for source in sources:
+                if source.connected:
+                    try:
+                        source.sync(bool(dialpad))
+                    except OSError as error:
+                        source.lost(error)
 
             # Configuration and focus changes wait for the centre button.
-            process_pending_driver_updates(gesture_idle=not mouse.center_held)
+            process_pending_driver_updates(gesture_idle=not any(source.center_held for source in sources))
 
-        except OSError as error:
-            log.warning("Lost the mouse (%s); looking for it again", error)
-            close_mouse()
-            mouse.set_active(False)
-            mouse.toggle_down = False
-            center_pressed = False
-            next_search = time() + MOUSE_RETRY_SECONDS
         except Exception:
-            log.exception("Error in listen_mouse_events")
+            log.exception("Error in listen_input_sources")
             break
 
 def config_dir_event(name):
@@ -3630,6 +4399,12 @@ def cleanup():
 
         if fd_t is not None:
             fd_t.close()
+        stop_kwin_script()
+        for source in input_sources:
+            try:
+                source.close()
+            except Exception:
+                log.exception("Failed to close the %s", source.name)
         close_mouse()
 
         if display_wayland:
@@ -3770,6 +4545,8 @@ def reset_udev_device():
             # pressed them; the next scroll step presses them on the new one.
             set_keys_held(scroll_modifiers_held, False, device=old_device)
             scroll_modifiers_held = []
+            # Keys a SpaceMouse button still holds go down on the new device too.
+            set_keys_held(list(spacemouse_applied_keys), True)
         close_virtual_device(old_device)
 
 def close_virtual_device(device):
@@ -3950,6 +4727,10 @@ try:
     # init the socket
     init_socket()
 
+    # A SpaceMouse run that was killed may have left spacenavd muted: undo it
+    # now, whether or not SpaceMouse mode is on any more.
+    restore_spacenav_at_start()
+
     # D-Bus startup runs independently so an unavailable session bus cannot delay the driver.
     init_dbus()
 
@@ -3984,7 +4765,7 @@ try:
     while not keymap_loaded:
         sleep(0.5)
 
-    if emulation or mouse_mode:
+    if emulation or touchpad_free:
         # The emulated dial takes the whole touchpad and the mouse dial the
         # mouse: never start with it on, and give the pointer back if the
         # driver stopped while it was on.
@@ -4057,9 +4838,9 @@ try:
     threads.append(t)
     t.start()
 
-    # The touchpad (or mouse) listener runs on the main thread
-    if mouse_mode:
-        listen_mouse_events()
+    # The touchpad (or mouse, SpaceMouse) listener runs on the main thread
+    if mouse_mode or spacemouse_mode:
+        listen_input_sources()
     else:
         listen_touchpad_events()
 except Exception:

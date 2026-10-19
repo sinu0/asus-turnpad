@@ -274,6 +274,7 @@ class VirtualDeviceTest(unittest.TestCase):
                 "uinput_rebuild_lock": threading.Lock(),
                 "scroll_modifier_lock": threading.Lock(),
                 "scroll_modifiers_held": ["KEY_LEFTCTRL"],
+                "spacemouse_applied_keys": [],
                 "InputEvent": lambda code, value: (code, value),
                 "EV_SYN": SimpleNamespace(SYN_REPORT="SYN"),
                 "EV_KEY": KeyCodes(),
@@ -291,6 +292,12 @@ class VirtualDeviceTest(unittest.TestCase):
         self.assertEqual(self.old.events, [("KEY_LEFTCTRL", 0), ("SYN", 0)])
         self.assertIs(self.driver["udev"], self.new)
         self.assertEqual(self.driver["scroll_modifiers_held"], [])
+
+    def test_keys_held_by_spacemouse_buttons_go_down_on_the_new_device(self):
+        self.driver["spacemouse_applied_keys"].extend(["KEY_Z"])
+        self.driver["reset_udev_device"]()
+        self.assertIn(("KEY_Z", 1), self.new.events)
+        self.assertNotIn(("KEY_Z", 1), self.old.events)
 
     def test_old_device_is_removed_at_once(self):
         uinput = self.old._uinput

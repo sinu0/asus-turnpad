@@ -117,6 +117,40 @@ class MouseConfig:
 
 
 @dataclass
+class SpaceMouseConfig:
+    # A 3Dconnexion SpaceMouse (through spacenavd) drives the dial: its buttons
+    # open the dial or a group's list, tilt picks, twist turns, a push on the
+    # cap is the centre button. Read at driver start. Axis numbers are the
+    # device's raw axes: 0 1 2 = X Y Z, 3 4 5 = RX RY RZ.
+    enabled: bool = False
+    # spacenavd's socket; "" = $SPNAV_SOCKET, /etc/spnavrc, the runtime dir.
+    socket: str = ""
+    # A button held this long (ms) runs its hold action.
+    hold_ms: int = 400
+    # Full deflection of an axis in raw units.
+    axis_max: int = 400
+    # The tilt axes [horizontal, vertical] (the raw axis that grows when the cap
+    # tilts right, and the one that grows when it tilts towards you) and
+    # whether each is inverted. The defaults are a SpacePilot Pro's raw axes as
+    # spacenavd reports them: tilt right = axis 5 +, tilt towards you = axis 3 +,
+    # twist clockwise = axis 4 - (inverted), push down = axis 1 - (inverted).
+    tilt_axes: list[int] = field(default_factory=lambda: [5, 3])
+    tilt_invert: list[bool] = field(default_factory=lambda: [False, False])
+    twist_axis: int = 4
+    twist_invert: bool = True
+    # Degrees per second at full twist.
+    twist_speed: int = 360
+    push_axis: int = 1
+    push_invert: bool = True
+    # Silence the other spacenavd clients (CAD programs) while the dial is on.
+    mute_others: bool = True
+    # Hide the buttons Turnpad uses from the other clients (experimental).
+    hide_buttons: bool = False
+    # Button index (as text) -> its actions; empty = default_spacemouse_buttons().
+    buttons: dict[str, SpaceMouseButton] = field(default_factory=dict)
+
+
+@dataclass
 class OverlayConfig:
     """Appearance of the GNOME Shell dial; read directly by the extension."""
 
@@ -202,6 +236,75 @@ class ModifierActions:
         return not any(getattr(self, name) for name in MACRO_FIELDS)
 
 
+SPACEMOUSE_ACTION_TYPES = ("macro", "modifier", "key_hold", "none", "dial", "group", "function", "select", "back")
+SPACEMOUSE_BUTTONS = 64
+
+
+@dataclass
+class SpaceMouseAction:
+    """What a SpaceMouse button does.
+
+    macro: ``macro`` (steps) or ``keys`` (one key chord) run once;
+    modifier: Ctrl, Shift or Alt are held while the button is down (press only);
+    key_hold: ``keys`` (any evdev keys) are held while the button is down, from
+    the press, or from the hold time when it is the hold action (a Blender pie
+    menu: hold Z); none: do nothing in Turnpad and leave the button to other
+    programs, to override a global binding in a profile;
+    dial: switch the dial on or off; group: open a group's list (``group``,
+    else the first one) of the current profile; function: enter a function of
+    the profile's dial, by name (``function``) or menu position (``slot``,
+    0 = the first entry; a group opens its list); select: tap the centre;
+    back: leave the function or list.
+    """
+
+    type: str
+    keys: list[str] | None = None
+    macro: list[MacroStep] | None = None
+    modifier: str | None = None
+    group: str | None = None
+    function: str | None = None
+    slot: int | None = None
+
+    def steps(self) -> list[MacroStep]:
+        """The macro to run: the steps, or the key chord as one keystroke."""
+        if self.macro:
+            return list(self.macro)
+        if self.keys:
+            return [MacroStep(type=StepType.KEYSTROKE, keys=list(self.keys))]
+        return []
+
+
+@dataclass
+class SpaceMouseButton:
+    press: SpaceMouseAction | None = None
+    hold: SpaceMouseAction | None = None
+
+
+def spacemouse_binds(button: SpaceMouseButton | None) -> bool:
+    """Whether Turnpad acts on this button: a press or hold that is not ``none``."""
+    return button is not None and any(
+        action is not None and action.type != "none" for action in (button.press, button.hold)
+    )
+
+
+def default_spacemouse_buttons() -> dict[str, SpaceMouseButton]:
+    """The map of a 3Dconnexion SpacePilot Pro when ``buttons`` is empty: Menu
+    (0) switches the dial; the function keys (17..21) enter the first five
+    entries of the profile's menu, held they open its first group; Esc (22)
+    goes back; Alt, Shift and Ctrl (23, 24, 25) are held down. The rest is left
+    to other applications."""
+    buttons = {"0": SpaceMouseButton(press=SpaceMouseAction("dial"))}
+    for number in range(5):
+        buttons[str(17 + number)] = SpaceMouseButton(
+            press=SpaceMouseAction("function", slot=number),
+            hold=SpaceMouseAction("group"),
+        )
+    buttons["22"] = SpaceMouseButton(press=SpaceMouseAction("back"))
+    for index, name in ((23, "Alt"), (24, "Shift"), (25, "Ctrl")):
+        buttons[str(index)] = SpaceMouseButton(press=SpaceMouseAction("modifier", modifier=name))
+    return buttons
+
+
 @dataclass
 class Segment:
     title: str
@@ -264,6 +367,9 @@ class Profile:
     remember_last: bool = True
     # Overrides of the on-screen dial for this profile (and its menu).
     overlay: dict = field(default_factory=dict)
+    # SpaceMouse buttons of this application; they replace the global
+    # binding of the same button (SpaceMouseConfig.buttons).
+    spacemouse_buttons: dict[str, SpaceMouseButton] = field(default_factory=dict)
 
     def active_segments(self) -> list[Segment]:
         return [segment for segment in self.segments if segment.enabled]
@@ -295,14 +401,42 @@ class DialPadConfig:
     backlight: BacklightConfig = field(default_factory=BacklightConfig)
     emulation: EmulationConfig = field(default_factory=EmulationConfig)
     mouse: MouseConfig = field(default_factory=MouseConfig)
+    spacemouse: SpaceMouseConfig = field(default_factory=SpaceMouseConfig)
     profiles: list[Profile] = field(default_factory=list)
 
 
-def shell_commands(profiles: list[Profile]) -> list[tuple[str, str, str]]:
-    """(profile, function, command) for everything that runs a program or
-    shell command, so imported profiles can be checked before use."""
+def _steps_commands(steps) -> list[str]:
+    commands = []
+    for step in steps or []:
+        if step.type is StepType.SHELL and step.script:
+            commands.append(step.script)
+        elif step.type is StepType.COMMAND and step.program:
+            commands.append(" ".join([step.program, *(step.args or [])]))
+    return commands
+
+
+def _spacemouse_commands(owner: str, buttons: dict[str, SpaceMouseButton]) -> list[tuple[str, str, str]]:
     found = []
+    for index, button in sorted(buttons.items(), key=lambda item: int(item[0])):
+        for kind, action in (("", button.press), (" (hold)", button.hold)):
+            if action is not None and action.type == "macro":
+                for command in _steps_commands(action.macro):
+                    found.append((owner, f"SpaceMouse button {index}{kind}", command))
+    return found
+
+
+def shell_commands(
+    profiles: list[Profile], spacemouse_buttons: dict[str, SpaceMouseButton] | None = None,
+) -> list[tuple[str, str, str]]:
+    """(profile, function, command) for everything that runs a program or
+    shell command, so imported profiles can be checked before use. That
+    includes the SpaceMouse buttons of the profiles and, given, the global
+    ``spacemouse_buttons``."""
+    found = []
+    if spacemouse_buttons:
+        found.extend(_spacemouse_commands("SpaceMouse", spacemouse_buttons))
     for profile in profiles:
+        found.extend(_spacemouse_commands(profile.name, profile.spacemouse_buttons))
         for group, segment in all_functions(profile.segments):
             title = f"{group.title} › {segment.title}" if group else segment.title
             for steps in segment.macro_lists():
@@ -388,10 +522,15 @@ def _encoder(obj):
             "backlight": _encoder(obj.backlight),
             "emulation": _encoder(obj.emulation),
             "mouse": _encoder(obj.mouse),
+            "spacemouse": _encoder(obj.spacemouse),
             "profiles": [_encoder(p) for p in obj.profiles],
         }
     if isinstance(obj, (TouchGeometry, ActivationConfig, GestureConfig, OverlayConfig, BacklightConfig, EmulationConfig, MouseConfig)):
         return {item.name: getattr(obj, item.name) for item in fields(obj)}
+    if isinstance(obj, SpaceMouseConfig):
+        result = {item.name: getattr(obj, item.name) for item in fields(obj) if item.name != "buttons"}
+        result["buttons"] = _spacemouse_buttons_dict(obj.buttons)
+        return result
     if isinstance(obj, Profile):
         result: dict = {
             "name": obj.name,
@@ -407,6 +546,8 @@ def _encoder(obj):
         result["remember_last"] = obj.remember_last
         if obj.overlay:
             result["overlay"] = dict(obj.overlay)
+        if obj.spacemouse_buttons:
+            result["spacemouse_buttons"] = _spacemouse_buttons_dict(obj.spacemouse_buttons)
         return result
     if isinstance(obj, Segment):
         result: dict = {
@@ -474,6 +615,7 @@ def _decoder(d: dict, cls: type):
             backlight=_decoder(d.get("backlight", {}), BacklightConfig),
             emulation=_decoder(d.get("emulation", {}), EmulationConfig),
             mouse=_decoder(d.get("mouse", {}), MouseConfig),
+            spacemouse=_decoder(d.get("spacemouse", {}), SpaceMouseConfig),
             profiles=[_decoder(p, Profile) for p in d.get("profiles", [])],
         )
     if cls is TouchGeometry:
@@ -533,6 +675,25 @@ def _decoder(d: dict, cls: type):
             scroll_speed=_clamp(d.get("scroll_speed", 1.0), 0.25, 4.0, 1.0),
             remember_last=bool(d.get("remember_last", True)),
             overlay=overlay_rule(d.get("overlay")),
+            spacemouse_buttons=_spacemouse_buttons(d.get("spacemouse_buttons")),
+        )
+    if cls is SpaceMouseConfig:
+        socket = d.get("socket", "")
+        return SpaceMouseConfig(
+            enabled=bool(d.get("enabled", False)),
+            socket=socket.strip() if isinstance(socket, str) else "",
+            hold_ms=int(_clamp(d.get("hold_ms", 400), 100, 3000, 400)),
+            axis_max=int(_clamp(d.get("axis_max", 400), 50, 5000, 400)),
+            tilt_axes=_axis_pair(d.get("tilt_axes"), [5, 3]),
+            tilt_invert=[bool(v) for v in _axis_pair(d.get("tilt_invert"), [False, False], axes=False)],
+            twist_axis=int(_clamp(d.get("twist_axis", 4), 0, 7, 4)),
+            twist_invert=bool(d.get("twist_invert", True)),
+            twist_speed=int(_clamp(d.get("twist_speed", 360), 30, 1440, 360)),
+            push_axis=int(_clamp(d.get("push_axis", 1), 0, 7, 1)),
+            push_invert=bool(d.get("push_invert", True)),
+            mute_others=bool(d.get("mute_others", True)),
+            hide_buttons=bool(d.get("hide_buttons", False)),
+            buttons=_spacemouse_buttons(d.get("buttons")),
         )
     if cls is Segment:
         items = d.get("items")
@@ -559,6 +720,118 @@ def _decoder(d: dict, cls: type):
         values["type"] = StepType(d["type"])
         return MacroStep(**values)
     raise TypeError(f"Unknown class: {cls}")
+
+
+def _axis_pair(value, default, axes=True):
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        return list(default)
+    if not axes:
+        return [bool(item) for item in value]
+    return [int(_clamp(item, 0, 7, fallback)) for item, fallback in zip(value, default)]
+
+
+def _spacemouse_action(values) -> SpaceMouseAction | None:
+    if not isinstance(values, dict) or values.get("type") not in SPACEMOUSE_ACTION_TYPES:
+        return None
+    keys = values.get("keys")
+    macro = values.get("macro")
+    modifier = values.get("modifier")
+    slot = values.get("slot")
+    if values["type"] == "key_hold" and not (isinstance(keys, list) and keys):
+        return None
+    return SpaceMouseAction(
+        type=values["type"],
+        keys=[str(key) for key in keys] if isinstance(keys, list) and keys else None,
+        macro=[_decoder(step, MacroStep) for step in macro if isinstance(step, dict)] if isinstance(macro, list) and macro else None,
+        modifier=modifier if modifier in MODIFIER_KEYS else None,
+        group=values["group"] if isinstance(values.get("group"), str) and values["group"] else None,
+        function=values["function"] if isinstance(values.get("function"), str) and values["function"] else None,
+        slot=slot if isinstance(slot, int) and not isinstance(slot, bool) and slot >= 0 else None,
+    )
+
+
+def _spacemouse_buttons(values) -> dict[str, SpaceMouseButton]:
+    buttons: dict[str, SpaceMouseButton] = {}
+    if not isinstance(values, dict):
+        return buttons
+    for key, entry in values.items():
+        try:
+            index = int(key)
+        except (TypeError, ValueError):
+            continue
+        if not 0 <= index < SPACEMOUSE_BUTTONS or not isinstance(entry, dict):
+            continue
+        button = SpaceMouseButton(
+            press=_spacemouse_action(entry.get("press")),
+            hold=_spacemouse_action(entry.get("hold")),
+        )
+        if button.press is not None or button.hold is not None:
+            buttons[str(index)] = button
+    return buttons
+
+
+def _spacemouse_action_dict(action: SpaceMouseAction) -> dict:
+    result: dict = {"type": action.type}
+    if action.keys:
+        result["keys"] = list(action.keys)
+    if action.macro:
+        result["macro"] = [_encoder(step) for step in action.macro]
+    for name in ("modifier", "group", "function", "slot"):
+        if getattr(action, name) is not None:
+            result[name] = getattr(action, name)
+    return result
+
+
+def _spacemouse_buttons_dict(buttons: dict[str, SpaceMouseButton]) -> dict:
+    result = {}
+    for key, button in buttons.items():
+        entry = {}
+        if button.press is not None:
+            entry["press"] = _spacemouse_action_dict(button.press)
+        if button.hold is not None:
+            entry["hold"] = _spacemouse_action_dict(button.hold)
+        if entry:
+            result[str(key)] = entry
+    return result
+
+
+def spacemouse_buttons_for(config: "DialPadConfig") -> dict[str, SpaceMouseButton]:
+    """The global SpaceMouse button map: the configured one, else the default."""
+    return config.spacemouse.buttons or default_spacemouse_buttons()
+
+
+def spacemouse_macros(config: "DialPadConfig") -> list[list[MacroStep]]:
+    """Every macro of the SpaceMouse buttons (global and per profile), so the
+    virtual keyboard can have their keys."""
+    buttons = [spacemouse_buttons_for(config)] + [profile.spacemouse_buttons for profile in config.profiles]
+    return [
+        action.steps()
+        for group in buttons for button in group.values()
+        for action in (button.press, button.hold)
+        if action is not None and action.type == "macro" and action.steps()
+    ]
+
+
+def spacemouse_hold_keys(config: "DialPadConfig") -> set[str]:
+    """The evdev key names the ``key_hold`` actions hold."""
+    buttons = [spacemouse_buttons_for(config)] + [profile.spacemouse_buttons for profile in config.profiles]
+    return {
+        key for group in buttons for button in group.values()
+        for action in (button.press, button.hold)
+        if action is not None and action.type == "key_hold"
+        for key in action.keys or []
+    }
+
+
+def spacemouse_modifier_keys(config: "DialPadConfig") -> set[str]:
+    """The evdev key names the modifier actions hold."""
+    buttons = [spacemouse_buttons_for(config)] + [profile.spacemouse_buttons for profile in config.profiles]
+    return {
+        key for group in buttons for button in group.values()
+        for action in (button.press, button.hold)
+        if action is not None and action.type == "modifier" and action.modifier in MODIFIER_KEYS
+        for key in MODIFIER_KEYS[action.modifier][:1]
+    }
 
 
 def _modifier_variants(values) -> dict[str, ModifierActions]:

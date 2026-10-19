@@ -1,10 +1,11 @@
 # Running the DialPad on another laptop model
 
-Turnpad has three modes (the table is in the [README](README.md#modes)):
+Turnpad has four modes (the table is in the [README](README.md#modes)):
 **DialPad mode** for an ASUS laptop with the DialPad printed on the touchpad
 (this page: another laptop model, calibration), **Touchpad mode** for any
 other touchpad (below) and **Mouse-only mode** for a computer without a
-touchpad, where a mouse is the dial (below).
+touchpad, where a mouse is the dial (below), and **SpaceMouse mode**, where a
+3Dconnexion SpaceMouse is the dial (last section).
 
 The driver detects ASUS touchpads by name (`ASUE`, `ELAN`, `ASUP`, `ASUF`,
 `ASCE`, `ASCF`, `ASCP` + `Touchpad` in `/proc/bus/input/devices`). What
@@ -100,6 +101,91 @@ the clicks stand still and the wheel does not scroll the window.
 
 Nothing is sent to a touchpad and calibration is not available. If Touchpad
 mode is switched on as well, Mouse-only mode wins.
+
+## SpaceMouse mode: a 3Dconnexion SpaceMouse
+
+A SpaceMouse (tested: SpacePilot Pro) can drive the dial on a computer without
+a touchpad, alone or together with Mouse-only mode. It needs `spacenavd` (the
+free driver for these devices; AUR `spacenavd` on Arch, packages of the same
+name elsewhere); it is optional and not a dependency of the packages. Turnpad
+is one more client of it, speaking its socket protocol; no library is needed.
+Enable it on the *SpaceMouse* page of the settings app (a switch, the device
+status, the buttons with their press and hold actions, per-application
+overrides, and the cap's axes) or in `~/.config/asus-turnpad/config.json`
+(`"spacemouse": {"enabled": true}`), then restart the driver. With a touchpad mode on the computer (a DialPad, or Touchpad
+mode) SpaceMouse mode is not supported yet and is ignored with a warning. The
+driver takes any touchpad named like an ASUS one (`ASUE`, `ELAN`, `ASUP`,
+`ASUF`, `ASCE`, `ASCF`, `ASCP` with `Touchpad`) for a DialPad, so on such a
+laptop (an ELAN touchpad included) SpaceMouse mode is ignored too, even if the
+touchpad has no printed dial; that limit goes away when the modes can be
+combined.
+
+- **Buttons:** each button (numbered as the device reports them: 0 = Menu,
+  17..21 = function keys 1..5, 22 = Esc, 23/24/25 = Alt/Shift/Ctrl on a
+  SpacePilot Pro) has a *press* action and a *hold* action (after `hold_ms`,
+  400). A button with only a press action acts at once. Actions: `macro`
+  (keys or steps), `modifier` (Ctrl/Shift/Alt held while the button is
+  down), `dial` (switch the dial on or off), `group` (open a group's list of
+  the current profile), `function` (enter a function by name or menu place),
+  `select`, `back`, `key_hold` (any `keys` held while the button is down,
+  as the press or, after `hold_ms`, as the hold action: hold `Z` to open a
+  Blender pie menu and let go to choose) and `none` (leave the button to the
+  application; in a profile it overrides the global binding, e.g. `Esc` and
+  `Ctrl` in Blender). Without a configured map the SpacePilot Pro default is
+  used: Menu opens the dial, the function keys enter the first five functions
+  (held: open the first group), Esc goes back, Alt/Shift/Ctrl are held. A
+  profile can bind buttons itself (`spacemouse_buttons`), which replaces the
+  global binding of that button; a profile with no functions but buttons keeps
+  the default profile's dial menu and applies its buttons. Other buttons are
+  left to other programs. Pressing a button that only holds keys (Ctrl) or is
+  left to other programs while the menu button is held does not cancel the
+  release-to-select.
+- **Release to select:** hold the button that opened the dial or a list,
+  tilt the cap towards a tile and let go of the button: it is chosen. Let go
+  without tilting and the menu stays open; tilt, then push the cap (or press
+  the same button) to choose, or press the same button again to close.
+- **Tilt** (away from you = top, right = 90 degrees) highlights the tile in
+  that direction; in a list, tilting forward or back steps through it (and
+  repeats while held, faster at full tilt). **Twist** turns the dial: in the
+  menu a step per sector, in a list a step per item, in a function like the
+  touchpad ring (threshold, sensitivity and scroll speed apply). Tilt and
+  twist ignore each other when one is clearly stronger. **Pushing the cap
+  down** is the centre button (tap; hold to go back).
+- **Other programs:** while the dial is on, Turnpad sets spacenavd's global
+  sensitivity to 0 so CAD programs stand still (`mute_others`), and puts it
+  back when the dial is off. A value that was active at that moment may linger
+  for other programs until the cap moves again, so switch the dial on with the
+  cap at rest. The old value is also saved in
+  `~/.config/asus-turnpad/spacenav-restore.json` and restored at the next
+  start if the driver was killed. `hide_buttons` (off, experimental) can
+  additionally hide the buttons Turnpad binds in the focused application's
+  profile from other programs (not the ones set to `none`, which pass
+  through); it follows the focus and gives the buttons back when you switch
+  (a button that is held down at that moment changes when it is let go).
+  Blender 5.2 itself binds the Menu button (its 3D-mouse panel), Fit, the view
+  axes, Roll and +/−, and leaves ISO, 1–12 and V1–V3 unbound, so turn this on
+  when Menu is the dial.
+- **Settings:** `socket` (empty: `$SPNAV_SOCKET`, `/etc/spnavrc`, the runtime
+  directory, `/var/run/spnav.sock`), `axis_max` (400), `tilt_axes`
+  (`[horizontal, vertical]`, default `[5, 3]`, with `tilt_invert`),
+  `twist_axis` (4) with `twist_invert` and `twist_speed` (360 degrees per
+  second at full twist), `push_axis` (1) with `push_invert`. Turnpad reads the
+  device's raw axes (0 1 2 = X Y Z, 3 4 5 = RX RY RZ, before spacenavd's own
+  axis swap), so spacenavd's dead zones and button mapping do not matter. The
+  defaults are measured on a SpacePilot Pro: tilt right = axis 5 positive,
+  tilt towards you = axis 3 positive (away = the top of the dial), twist
+  clockwise = axis 4 negative, push down = axis 1 negative; the translation
+  axes (they move a little while tilting) are not read. Another model may
+  need `*_invert` or other axes: look at the raw values with `spnav_ex` or
+  `spacenavd -d`.
+- **If the driver was killed** while the dial was on or buttons were hidden,
+  spacenavd may be left muted (sensitivity 0) or with remapped buttons
+  (index 63). The next driver start gives it back from the restore file, even
+  with SpaceMouse mode off. Do not save spacenavd's configuration (spnavcfg)
+  while the dial is on or `hide_buttons` is active: it would keep sensitivity 0
+  or the mapping. `hide_buttons` maps buttons away from other programs; it
+  does not hide buttons that spacenavd itself acts on through its own
+  `bnact` or `kbmap` settings.
 
 ## Sharing a working model
 

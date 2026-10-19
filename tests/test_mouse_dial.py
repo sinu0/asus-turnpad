@@ -543,8 +543,9 @@ class MouseDriverTest(unittest.TestCase):
 
 
 MOUSE_FUNCTIONS = {
-    "mouse_toggle_key", "set_mouse_grab", "close_mouse", "listen_mouse_events",
+    "mouse_toggle_key", "set_mouse_grab", "close_mouse", "listen_input_sources", "go_back",
 }
+MOUSE_CLASSES = {"CenterGesture", "InputSource", "MouseSource"}
 
 
 def rel(code, value):
@@ -587,14 +588,18 @@ def key(code, value):
 
 
 class MouseLoopTest(unittest.TestCase):
-    """listen_mouse_events() with a scripted select(): each step feeds events,
+    """listen_input_sources() with a scripted select(): each step feeds events,
     the loop runs one pass, and the step's checks look at the result."""
 
     def setUp(self):
         with open(os.path.join(ROOT, "dialpad.py"), encoding="utf-8") as source:
             tree = ast.parse(source.read())
-        functions = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in MOUSE_FUNCTIONS]
-        self.assertEqual({node.name for node in functions}, MOUSE_FUNCTIONS)
+        functions = [
+            node for node in tree.body
+            if (isinstance(node, ast.FunctionDef) and node.name in MOUSE_FUNCTIONS)
+            or (isinstance(node, ast.ClassDef) and node.name in MOUSE_CLASSES)
+        ]
+        self.assertEqual({node.name for node in functions}, MOUSE_FUNCTIONS | MOUSE_CLASSES)
         self.calls, self.sent, self.steps, self.failures = [], [], [], []
         self.clock = 1000.0
         self.mouse = FakeMouse(self.calls)
@@ -629,6 +634,7 @@ class MouseLoopTest(unittest.TestCase):
             "leave_function": lambda: self.calls.append("leave"),
             "show_menu_after_gesture": lambda: self.calls.append("menu"),
             "open_mouse": lambda _code: False,
+            "mouse_mode": True, "spacemouse_mode": False, "input_sources": [],
         }
         exec(compile(ast.Module(body=functions, type_ignores=[]), "dialpad.py", "exec"), namespace)
         self.driver = namespace
@@ -661,7 +667,7 @@ class MouseLoopTest(unittest.TestCase):
 
     def run_steps(self, *steps):
         self.steps = list(steps)
-        self.driver["listen_mouse_events"]()
+        self.driver["listen_input_sources"]()
         if self.failures:
             raise self.failures[0]
 

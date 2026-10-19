@@ -77,7 +77,7 @@ def _legacy_group(group: Segment, index: int) -> dict:
 
 
 def _profile_meta(profile: Profile) -> dict:
-    return {
+    meta = {
         "name": profile.name,
         "mode": profile.mode,
         "sensitivity": profile.sensitivity,
@@ -85,6 +85,9 @@ def _profile_meta(profile: Profile) -> dict:
         "remember_last": profile.remember_last,
         "overlay": dict(profile.overlay),
     }
+    if profile.spacemouse_buttons:
+        meta["spacemouse_buttons"] = dict(profile.spacemouse_buttons)
+    return meta
 
 
 def _profile_shortcuts(profile: Profile) -> dict | None:
@@ -128,13 +131,28 @@ def _profile_shortcuts(profile: Profile) -> dict | None:
     }
 
 
+def _buttons_only_shortcuts(profile: Profile, base: dict) -> dict:
+    """A profile without functions that binds SpaceMouse buttons: the dial keeps
+    showing the default profile's menu (``base``), the profile's name and buttons
+    are the ones in force while its application has focus."""
+    shortcuts = dict(base)
+    meta = dict(base.get(META_KEY) or {})
+    meta.update(_profile_meta(profile))
+    shortcuts[META_KEY] = meta
+    return shortcuts
+
+
 def shortcuts_from_config(config: DialPadConfig) -> dict:
     shortcuts = {}
     first_populated = None
+    buttons_only = []
     for profile in config.profiles:
         profile_shortcuts = _profile_shortcuts(profile)
-        # An unfinished application profile must fall back to the default one.
+        # An unfinished application profile must fall back to the default one,
+        # unless it only exists for its SpaceMouse buttons.
         if profile_shortcuts is None:
+            if profile.spacemouse_buttons:
+                buttons_only.append(profile)
             continue
         if first_populated is None:
             first_populated = profile_shortcuts
@@ -149,6 +167,12 @@ def shortcuts_from_config(config: DialPadConfig) -> dict:
             if first_populated is not None
             else {"center": [], "clockwise": [], "counterclockwise": []}
         )
+    for profile in buttons_only:
+        if profile.app_id is None:
+            # The default profile with buttons only: the first menu that exists, with its buttons.
+            shortcuts["none"] = _buttons_only_shortcuts(profile, shortcuts["none"])
+        else:
+            shortcuts[profile.app_id] = _buttons_only_shortcuts(profile, shortcuts["none"])
     return shortcuts
 
 

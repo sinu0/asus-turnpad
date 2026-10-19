@@ -16,7 +16,7 @@ What Turnpad adds to the original driver:
 - **Groups**: a sector that opens a straight list of more functions beside the dial; turn to move along it, tap the centre to choose. More functions fit without smaller sectors.
 - **GNOME Shell overlay**: native radial dial with value gauge, rotation hints and finger position; size, position (anywhere on the screen or next to the mouse pointer) and visibility configurable: always visible, fading while you turn, or a small label instead of the dial — for all apps, per profile or per function.
 - **Guided calibration** that measures the dial on any DialPad touchpad — see [PORTING.md](PORTING.md).
-- **Three modes**: the dial works with the DialPad printed on an ASUS touchpad, with any other touchpad, or with just a mouse — see [Modes](#modes).
+- **Four modes**: the dial works with the DialPad printed on an ASUS touchpad, with any other touchpad, with just a mouse, or with a 3Dconnexion SpaceMouse — see [Modes](#modes).
 
 ## Modes
 
@@ -24,9 +24,10 @@ What Turnpad adds to the original driver:
 | --- | --- | --- | --- | --- | --- | --- |
 | **DialPad mode** | ASUS laptop with the DialPad printed on the touchpad | hold the illuminated top-right corner | circle a finger on the printed ring | tap the centre button | hold the centre button | default; calibrate once on other models ([details](PORTING.md#running-the-dialpad-on-another-laptop-model)) |
 | **Touchpad mode** | any other touchpad (also on laptops of other makes) | hold the touchpad's top-right corner, or a keyboard shortcut | circle a finger anywhere on the touchpad | tap the middle of the touchpad | hold the middle | *Driver → Touchpad mode* ([details](PORTING.md#touchpad-mode-touchpads-without-a-dialpad)) |
+| **SpaceMouse mode** | a 3Dconnexion SpaceMouse / SpacePilot (needs `spacenavd`), alone or with a mouse | a button of the SpaceMouse (default Menu); function keys enter functions directly | twist the cap | tilt towards a tile, then release the button or push the cap | `Esc` button, or hold the push | the *SpaceMouse* page of the settings app (or config `spacemouse`) ([details](PORTING.md#spacemouse-mode-a-3dconnexion-spacemouse)) |
 | **Mouse-only mode** | computer without a touchpad (desktop PC) | a key the mouse sends (F13, e.g. a side button mapped with Piper) | mouse wheel, or move the mouse in circles | left click, or the middle button | right click, or hold the middle button | *Driver → Mouse-only mode* ([details](PORTING.md#mouse-only-mode-computers-without-a-touchpad)) |
 
-In Touchpad mode the whole touchpad is the dial and the pointer stands still while it is on; in Mouse-only mode the driver grabs the mouse while the dial is on. Everything else (profiles, functions, on-screen dial, skins) is the same in all three.
+In Touchpad mode the whole touchpad is the dial and the pointer stands still while it is on; in Mouse-only mode the driver grabs the mouse while the dial is on. SpaceMouse mode works on a computer without a touchpad, alone or together with Mouse-only mode. Everything else (profiles, functions, on-screen dial, skins) is the same in all modes.
 
 ### Install
 

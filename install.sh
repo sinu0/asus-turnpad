@@ -134,13 +134,13 @@ set -o pipefail
     sudo install dialpad.py "$INSTALL_DIR_PATH"
     sudo install dialpad_dbus.py "$INSTALL_DIR_PATH"
     sudo install dial_gesture.py "$INSTALL_DIR_PATH"
-    sudo install -m 644 backlight.py dir_watch.py launch.py layout_detect.py mouse_dial.py xkb.py laptop_touchpad_dialpad_layouts.csv "$INSTALL_DIR_PATH"
+    sudo install -m 644 backlight.py dir_watch.py launch.py layout_detect.py mouse_dial.py spacemouse_dial.py spacenav_client.py xkb.py laptop_touchpad_dialpad_layouts.csv "$INSTALL_DIR_PATH"
     sudo install -t "$INSTALL_DIR_PATH/layouts" layouts/*.py
     sudo install -m 644 -t "$INSTALL_DIR_PATH/config" config/*.py
     sudo install -m 644 -t "$INSTALL_DIR_PATH/desktop" desktop/*.py
     sudo install -m 644 -t "$INSTALL_DIR_PATH/overlay" overlay/*.py
     sudo install -m 755 config_app/main.py "$INSTALL_DIR_PATH/config_app/main.py"
-    sudo install -m 644 config_app/__init__.py config_app/outline_editor.py config_app/icon.svg config_app/style.css "config_app/$APP_ID.desktop" "$INSTALL_DIR_PATH/config_app/"
+    sudo install -m 644 config_app/__init__.py config_app/outline_editor.py config_app/spacemouse.py config_app/icon.svg config_app/style.css "config_app/$APP_ID.desktop" "$INSTALL_DIR_PATH/config_app/"
     sudo install -m 644 gnome/extension/extension.js gnome/extension/dial.js gnome/extension/layers.js gnome/extension/skins.json gnome/extension/metadata.json gnome/extension/stylesheet.css "$INSTALL_DIR_PATH/gnome/extension/"
 
     mkdir -p "$(dirname "$LAUNCHER_PATH")" "$(dirname "$ICON_PATH")"

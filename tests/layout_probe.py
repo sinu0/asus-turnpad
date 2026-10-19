@@ -24,7 +24,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 import screenshot_settings as demo  # noqa: E402
 from gi.repository import Adw, Gio, GLib, Gtk  # noqa: E402
 
-from config.schema import StepType  # noqa: E402
+from config.schema import MacroStep, SpaceMouseAction, SpaceMouseButton, StepType  # noqa: E402
 
 # Window sizes in logical pixels: monitors minus the GNOME top bar.
 SIZES = {
@@ -33,7 +33,7 @@ SIZES = {
     "1080p": (1920, 1048),
     "4K": (3840, 2128),
 }
-PAGES = ("actions", "profiles", "look", "device", "calibration", "diagnostics")
+PAGES = ("actions", "profiles", "look", "device", "calibration", "spacemouse", "diagnostics")
 CALIBRATION_RESULT = {"circle_diameter": 1012, "center_button_diameter": 388, "center_x": 3341, "center_y": 640}
 # Long enough for a resize or a new page to be laid out and mapped.
 SETTLE_MS = 120
@@ -121,6 +121,30 @@ def dialogs(app, profile):
     app._show_skin_editor(None, {"name": "Probe", "base": "proart"})
     yield "skin editor"
     demo.close_dialogs(app)
+    # A SpaceMouse button with a long macro and a function by name, for all
+    # applications and for a profile.
+    title = profile.segments[0].title
+    app.config.spacemouse.buttons = {
+        "18": SpaceMouseButton(
+            press=SpaceMouseAction("macro", keys=["KEY_LEFTCTRL", "KEY_LEFTSHIFT", "KEY_TAB"], macro=[
+                MacroStep(type=StepType.KEYSTROKE, keys=["KEY_LEFTCTRL", "KEY_C"]),
+                MacroStep(type=StepType.SHELL, script="notify-send a-rather-long-command-line --with-options"),
+            ]),
+            hold=SpaceMouseAction("function", function=title),
+        ),
+    }
+    app._sm_scope = None
+    app._refresh_spacemouse_page()
+    app._show_spacemouse_button_dialog(18)
+    yield "SpaceMouse button editor"
+    demo.close_dialogs(app)
+    app._sm_scope = profile
+    app._refresh_spacemouse_page()
+    app._show_spacemouse_button_dialog(18)
+    yield "SpaceMouse button editor of a profile"
+    demo.close_dialogs(app)
+    app._sm_scope = None
+    app._refresh_spacemouse_page()
 
 
 def sidebar_faults(app):

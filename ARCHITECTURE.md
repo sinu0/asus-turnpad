@@ -23,7 +23,7 @@ Turnpad is a set of separately running parts that talk over the session D-Bus an
 | Configuration model, presets, skins | No | `config/` |
 | D-Bus service | No (session bus) | `dialpad_dbus.py` |
 | Settings app | No (GTK4 runs everywhere) | `config_app/` |
-| Focused application | **Yes**, one backend each | `desktop/active_window.py` |
+| Focused application | **Yes**, one backend each; KDE Plasma pushes it from a KWin script | `desktop/active_window.py`, `desktop/kwin_script.py` |
 | Light/dark preference | No (XDG portal, gsettings fallback) | `desktop/color_scheme.py` |
 | On-screen dial | **Yes**, one frontend each | `gnome/extension/`, `overlay/layer_shell.py`, `dialpad_ui.py` |
 | What the dial shows, where and when | No (pure Python twins of the JavaScript) | `overlay/look.py`, `overlay/visibility.py` |
@@ -52,7 +52,7 @@ def example(context: Context) -> WindowInfo:
     return binary_from_pid(window["pid"]), window["title"]
 ```
 
-It returns `(binary path, title)` or raises. Backends are tried in registration order and dropped after `max_failures` errors. A frontend that knows the focused app itself can push it instead, like the GNOME extension: call `SetActiveApplication(desktop_id)` on the D-Bus service.
+It returns `(binary path, title)` or raises. Backends are tried in registration order and dropped after `max_failures` errors. A frontend that knows the focused app itself can push it instead, like the GNOME extension: call `SetActiveApplication(desktop_id)` on the D-Bus service. KDE Plasma 6 has no call that names the active window, so `desktop/kwin_script.py` writes a small KWin script to `$XDG_RUNTIME_DIR/asus-turnpad/kwin-active-window.js`, loads it through `org.kde.KWin /Scripting` (`unloadScript`, `loadScript`, `start`) when the driver's D-Bus service is up, and unloads it on exit (also when loading `start` fails or the driver stops meanwhile). It is for Plasma on Wayland with an `XDG_RUNTIME_DIR` only: on KDE X11 the `x11` polling backend answers (binary path), and a second source with desktop ids would fight it. The script calls `SetActiveApplication(window.desktopFileName || window.resourceClass)` on every activation and once at load.
 
 ### 2. On-screen dial
 

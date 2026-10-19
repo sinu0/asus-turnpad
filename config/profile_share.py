@@ -8,7 +8,7 @@ import json
 import re
 
 from config.labels import parse_keys
-from config.schema import MACRO_FIELDS, MODIFIER_KEYS, SCROLL_AXES, MacroStep, Profile, Segment, StepType, _decoder, _encoder
+from config.schema import MACRO_FIELDS, MODIFIER_KEYS, SCROLL_AXES, SPACEMOUSE_ACTION_TYPES, MacroStep, Profile, Segment, StepType, _decoder, _encoder
 
 PROFILE_FORMAT = """A Turnpad profile is one JSON object:
 - "name": shown in the settings app.
@@ -16,6 +16,7 @@ PROFILE_FORMAT = """A Turnpad profile is one JSON object:
 - "mode": "multi" (radial menu of functions) or "single" (the dial always runs the function named in "single_function").
 - "sensitivity" and "scroll_speed": 0.25 to 4 (1 = normal); "remember_last": true reopens the last used function.
 - "overlay": optional; how the on-screen dial shows for this profile, overriding the user's defaults: "position" ("top", "center", "lower", "bottom", "custom" with "custom_x" and "custom_y", the dial's centre as fractions 0 to 1 of the screen, or "pointer": next to the mouse pointer, never covering it, on "pointer_side" ("below-right", "below-left", "above-right", "above-left", "right", "left", "above" or "below") "pointer_gap" pixels away, 0 to 400, default 24), "visibility" ("full"; "fade": fades to "fade_opacity" percent while turning; "pill": a small label instead of the dial). Leave it out unless asked.
+- "spacemouse_buttons": optional; what the buttons of a 3Dconnexion SpaceMouse do while this application is focused: {"<button number>": {"press": ACTION, "hold": ACTION}} with either optional, ACTION being {"type": "macro", "keys": ["KEY_LEFTCTRL", "KEY_Z"]} (or "macro": steps like below), {"type": "modifier", "modifier": "Ctrl"} (Ctrl, Shift or Alt held while the button is down; press only), {"type": "key_hold", "keys": ["KEY_Z"]} (any keys held while the button is down, as press or as hold; e.g. a pie menu that opens while a key is held), {"type": "none"} (do nothing, leave the button to the application; overrides a global binding), {"type": "dial"}, {"type": "group", "group": "<group title>"} (optional title), {"type": "function", "function": "<title>"} (or "slot": menu place from 0), {"type": "select"} or {"type": "back"}. Leave it out unless asked.
 - "segments": the functions, clockwise from the top of the dial; 3 to 8 work best. Each one has:
   - "title": short and unique in the profile, shown on the dial.
   - "color": optional "#rrggbb".
@@ -105,6 +106,40 @@ def _check_step(step: MacroStep, where: str) -> None:
         raise ProfileTextError(f"{where}: a command step needs a \"program\".")
 
 
+def _check_spacemouse(buttons, where: str) -> None:
+    """The raw ``spacemouse_buttons``: known action types, key_hold with keys."""
+    if buttons is None:
+        return
+    if not isinstance(buttons, dict):
+        raise ProfileTextError(f"{where}: \"spacemouse_buttons\" must map button numbers to press and hold actions.")
+    for number, entry in buttons.items():
+        label = f"{where}, SpaceMouse button {number}"
+        if not isinstance(entry, dict):
+            raise ProfileTextError(f"{label}: expected {{\"press\": ..., \"hold\": ...}}.")
+        for slot in ("press", "hold"):
+            action = entry.get(slot)
+            if action is None:
+                continue
+            kind = action.get("type") if isinstance(action, dict) else None
+            if kind not in SPACEMOUSE_ACTION_TYPES:
+                raise ProfileTextError(f"{label}: unknown {slot} action {kind!r}; use " + ", ".join(SPACEMOUSE_ACTION_TYPES) + ".")
+            if kind == "key_hold" and not (isinstance(action.get("keys"), list) and action["keys"]):
+                raise ProfileTextError(f"{label}: a key_hold action needs \"keys\".")
+
+
+def _clean_spacemouse(profile: Profile, where: str) -> None:
+    """Key names as evdev names (an assistant may write "Z" or "Ctrl"), the steps checked like a function's."""
+    for number, button in profile.spacemouse_buttons.items():
+        for slot, action in (("press", button.press), ("hold", button.hold)):
+            if action is None:
+                continue
+            label = f"{where}, SpaceMouse button {number} ({slot})"
+            if action.keys:
+                action.keys = _keys(action.keys, label)
+            for step in action.macro or []:
+                _check_step(step, label)
+
+
 def _profile(data, number: int) -> Profile:
     where = f"Profile {number}"
     if not isinstance(data, dict):
@@ -113,10 +148,12 @@ def _profile(data, number: int) -> Profile:
         raise ProfileTextError(f"{where} has no \"segments\" list.")
     data = {"name": "Imported profile", **data}
     _check_functions(data["segments"], where)
+    _check_spacemouse(data.get("spacemouse_buttons"), where)
     try:
         profile = _decoder(data, Profile)
     except (KeyError, TypeError, ValueError) as error:
         raise ProfileTextError(f"{where} could not be read: {error}") from None
+    _clean_spacemouse(profile, where)
 
     _clean_functions(profile.segments, where)
     for segment in profile.segments:

@@ -56,6 +56,8 @@ from config.schema import (
     ModifierActions,
     Profile,
     Segment,
+    SpaceMouseAction,
+    SpaceMouseButton,
     StepType,
     _encoder,
     darktable_colour_labels_segment,
@@ -88,6 +90,7 @@ from config.skins import (
     user_skins,
     without_private_keys,
 )
+from config_app import spacemouse as sm
 from config_app.outline_editor import PRESETS, OutlineEditor
 from desktop.color_scheme import ColorScheme
 from overlay.gtk_icons import draw_icon
@@ -364,6 +367,18 @@ class Application(Adw.Application):
         # Geometry before a guided measurement, kept until the user keeps or
         # reverts the result: (TouchGeometry, device_name).
         self._calibration_backup = None
+        # SpaceMouse page: the profile whose buttons are edited (None = all
+        # applications), its widgets and the "press a button" listener.
+        self._sm_scope: Profile | None = None
+        self._sm_group = None
+        self._sm_scope_row = None
+        self._sm_scope_handler = 0
+        self._sm_rows = {}
+        self._sm_identify_row = None
+        self._sm_probe = None
+        self._sm_extra_buttons = 0
+        self._sm_status_row = None
+        self._sm_restart_source = 0
 
     # --- lifecycle --------------------------------------------------------
 
@@ -407,6 +422,7 @@ class Application(Adw.Application):
             (self._build_look_page(), "look", "Skins", "preferences-desktop-appearance-symbolic"),
             (self._build_behaviour_page(), "device", "Behaviour", "preferences-system-symbolic"),
             (self._build_calibration_page(), "calibration", "Calibration", "find-location-symbolic"),
+            (self._build_spacemouse_page(), "spacemouse", "SpaceMouse", "input-gaming-symbolic"),
             (self._build_diagnostics_page(), "diagnostics", "Driver", "utilities-terminal-symbolic"),
         )
         for child, name, page_title, icon_name in pages:
@@ -456,12 +472,18 @@ class Application(Adw.Application):
         return "proartp16"
 
     def do_shutdown(self):
+        self._stop_spacemouse_probe()
         # A measurement nobody kept is not accepted: the driver goes back too.
         if self._calibration_backup is not None and self.config is not None:
             geometry, self.config.device_name = self._calibration_backup
             self.config.geometry = copy.copy(geometry)
             self._calibration_backup = None
             self._schedule_save()
+        if self._sm_restart_source:
+            # A SpaceMouse setting waits for its delayed restart: save and restart now.
+            GLib.source_remove(self._sm_restart_source)
+            self._sm_restart_source = 0
+            self._restart_driver()
         if self._save_source:
             GLib.source_remove(self._save_source)
             self._save_config()
@@ -619,12 +641,15 @@ class Application(Adw.Application):
     def _refresh_all(self):
         self._refresh_profiles_page()
         self._rebuild_actions_page()
+        self._refresh_spacemouse_page()
 
     def _on_visible_page_changed(self, stack, _param):
         name = stack.get_visible_child_name()
+        if name != "spacemouse":
+            self._stop_spacemouse_probe()
         if name == "actions":
             self._rebuild_actions_page()
-        elif name == "diagnostics":
+        elif name in ("diagnostics", "spacemouse"):
             self._refresh_diagnostics()
 
     def _scrolled_content(self, content, width=760):
@@ -3716,6 +3741,531 @@ class Application(Adw.Application):
 
     # --- Driver -----------------------------------------------------------------------
 
+    # --- SpaceMouse -------------------------------------------------------------------
+
+    def _build_spacemouse_page(self):
+        content = self._page_box()
+        content.append(self._spacemouse_group())
+        self._sm_group = Adw.PreferencesGroup(
+            title="Buttons",
+            description=(
+                "What each button of the SpaceMouse does. A button you leave alone passes through to "
+                "other applications. Click a button to change it."
+            ),
+        )
+        self._sm_scope_row = Adw.ComboRow(
+            title="Applies to", subtitle="A profile's own binding replaces the one of All applications",
+            model=Gtk.StringList.new(["All applications"]),
+        )
+        self._sm_scope_handler = self._sm_scope_row.connect("notify::selected", self._on_spacemouse_scope)
+        self._sm_group.add(self._sm_scope_row)
+        self._sm_identify_row = _button_row("Press a SpaceMouse button…", "input-gaming-symbolic")
+        self._sm_identify_row.connect("activated", lambda _row: self._toggle_spacemouse_identify())
+        self._sm_group.add(self._sm_identify_row)
+        content.append(self._sm_group)
+        content.append(self._spacemouse_cap_group())
+        return self._scrolled_content(content)
+
+    def _spacemouse_group(self):
+        """Switch, status and the few settings that are not about a button."""
+        settings = self.config.spacemouse
+        group = Adw.PreferencesGroup(
+            title="SpaceMouse mode",
+            description=(
+                "A 3Dconnexion SpaceMouse (through spacenavd) drives the dial: its buttons open the dial, "
+                "tilting the cap picks, twisting turns, pushing the cap is the centre button."
+            ),
+        )
+        options = []
+
+        def enabled_changed(active):
+            for row in options:
+                row.set_sensitive(active)
+            if settings.enabled != active:
+                settings.enabled = active
+                # The driver opens spacenavd at start.
+                self._restart_driver()
+
+        group.add(_switch_row(
+            "SpaceMouse mode", "A SpaceMouse is the dial; restarts the driver", settings.enabled, enabled_changed,
+        ))
+        self._sm_status_row = Adw.ActionRow(title="Status", subtitle="Unknown")
+        self._sm_status_row.set_subtitle_lines(0)
+        group.add(self._sm_status_row)
+        options.append(_switch_row(
+            "Mute other applications",
+            "While the dial is on, CAD programs get no motion from the cap",
+            settings.mute_others, lambda active: self._apply_spacemouse_setting("mute_others", active),
+        ))
+        options.append(_switch_row(
+            "Hide Turnpad's buttons from other applications",
+            "Experimental: the buttons Turnpad uses do not reach other programs",
+            settings.hide_buttons, lambda active: self._apply_spacemouse_setting("hide_buttons", active),
+        ))
+        options.append(_spin_row(
+            "Long-press time", "Milliseconds a button is held to run its hold action",
+            settings.hold_ms, 100, 3000, 50, 0,
+            lambda value: self._apply_spacemouse_setting("hold_ms", int(value)),
+        ))
+        for row in options:
+            row.set_sensitive(settings.enabled)
+            group.add(row)
+        return group
+
+    def _apply_spacemouse_setting(self, attribute, value):
+        """A setting the driver reads at start: restart it once the changes stop."""
+        settings = self.config.spacemouse
+        if getattr(settings, attribute) == value:
+            return
+        setattr(settings, attribute, value)
+        if not settings.enabled:
+            self._schedule_save()
+            return
+        if self._sm_restart_source:
+            GLib.source_remove(self._sm_restart_source)
+
+        def restart():
+            self._sm_restart_source = 0
+            self._restart_driver()
+            return GLib.SOURCE_REMOVE
+
+        self._sm_restart_source = GLib.timeout_add(900, restart)
+
+    def _update_spacemouse_status(self, status):
+        row = self._sm_status_row
+        if row is None:
+            return
+        if status is None:
+            row.set_subtitle("The driver is not running")
+        elif status.get("spacemouse"):
+            device = status.get("spacemouse_device")
+            row.set_subtitle(f"Connected · {device}" if device else "Connected")
+        elif not sm.socket_exists(self.config.spacemouse.socket):
+            row.set_subtitle(
+                "spacenavd is not running. Install the spacenavd package of your distribution "
+                "(Arch: from the AUR) and start it: systemctl enable --now spacenavd"
+            )
+        elif self.config.spacemouse.enabled:
+            row.set_subtitle("Not connected: spacenavd is running but no SpaceMouse answers")
+        else:
+            row.set_subtitle("Off")
+
+    def _spacemouse_cap_group(self):
+        """Which raw axis is tilt, twist and push (advanced)."""
+        settings = self.config.spacemouse
+        group = Adw.PreferencesGroup()
+        expander = Adw.ExpanderRow(
+            title="Cap and axes", subtitle="Advanced: which axis of the cap does what",
+        )
+        axes = list(sm.AXIS_LABELS)
+
+        def axis_row(title, subtitle, get, set_value):
+            row = _combo_row(title, subtitle, axes, min(max(int(get()), 0), len(axes) - 1), set_value)
+            expander.add_row(row)
+
+        def invert_row(title, get, set_value):
+            expander.add_row(_switch_row(title, "", bool(get()), set_value))
+
+        def set_pair(attribute, position, value):
+            pair = list(getattr(settings, attribute))
+            pair[position] = value
+            self._apply_spacemouse_setting(attribute, pair)
+
+        axis_row("Tilt left / right", "The axis that grows when the cap tilts right",
+                 lambda: settings.tilt_axes[0], lambda index: set_pair("tilt_axes", 0, index))
+        invert_row("Invert tilt left / right", lambda: settings.tilt_invert[0],
+                   lambda active: set_pair("tilt_invert", 0, active))
+        axis_row("Tilt forward / back", "The axis that grows when the cap tilts towards you",
+                 lambda: settings.tilt_axes[1], lambda index: set_pair("tilt_axes", 1, index))
+        invert_row("Invert tilt forward / back", lambda: settings.tilt_invert[1],
+                   lambda active: set_pair("tilt_invert", 1, active))
+        axis_row("Twist", "The axis that grows when the cap turns clockwise",
+                 lambda: settings.twist_axis, lambda index: self._apply_spacemouse_setting("twist_axis", index))
+        invert_row("Invert twist", lambda: settings.twist_invert,
+                   lambda active: self._apply_spacemouse_setting("twist_invert", active))
+        expander.add_row(_spin_row(
+            "Twist speed", "Degrees per second at full twist",
+            settings.twist_speed, 30, 1440, 30, 0,
+            lambda value: self._apply_spacemouse_setting("twist_speed", int(value)),
+        ))
+        axis_row("Push", "The axis that is the centre button when the cap is pushed down",
+                 lambda: settings.push_axis, lambda index: self._apply_spacemouse_setting("push_axis", index))
+        invert_row("Invert push", lambda: settings.push_invert,
+                   lambda active: self._apply_spacemouse_setting("push_invert", active))
+        expander.add_row(_spin_row(
+            "Full deflection", "Raw value of an axis pushed as far as it goes",
+            settings.axis_max, 50, 5000, 50, 0,
+            lambda value: self._apply_spacemouse_setting("axis_max", int(value)),
+        ))
+        group.add(expander)
+        return group
+
+    # The button list ---------------------------------------------------------------
+
+    def _refresh_spacemouse_page(self):
+        """Follow profiles that were added, renamed or removed."""
+        if self._sm_group is None or self.config is None:
+            return
+        if self._sm_scope is not None and self._sm_scope not in self.config.profiles:
+            self._sm_scope = None
+        labels = ["All applications"] + [
+            profile.name if profile.app_id is None else f"{profile.name}  ·  app" for profile in self.config.profiles
+        ]
+        self._sm_scope_row.handler_block(self._sm_scope_handler)
+        self._sm_scope_row.set_model(Gtk.StringList.new(labels))
+        self._sm_scope_row.set_selected(
+            0 if self._sm_scope is None else self.config.profiles.index(self._sm_scope) + 1
+        )
+        self._sm_scope_row.handler_unblock(self._sm_scope_handler)
+        self._rebuild_spacemouse_rows()
+
+    def _on_spacemouse_scope(self, row, _param):
+        index = row.get_selected()
+        profiles = self.config.profiles if self.config is not None else []
+        scope = profiles[index - 1] if 1 <= index <= len(profiles) else None
+        if scope is not self._sm_scope:
+            self._sm_scope = scope
+            self._rebuild_spacemouse_rows()
+
+    def _spacemouse_changed(self):
+        """A button was edited: show it in the list and save."""
+        self._rebuild_spacemouse_rows()
+        self._schedule_save()
+
+    def _rebuild_spacemouse_rows(self):
+        group = self._sm_group
+        if group is None or self.config is None:
+            return
+        for row in self._sm_rows.values():
+            group.remove(row)
+        self._sm_rows = {}
+        profile = self._sm_scope
+        maps = [sm.global_buttons(self.config)] + [item.spacemouse_buttons for item in self.config.profiles]
+        count = max(sm.button_count(maps), self._sm_extra_buttons)
+        for index in range(count):
+            button, source = sm.binding(self.config, profile, index)
+            text = sm.describe_button(button)
+            row = Adw.ActionRow(title=GLib.markup_escape_text(sm.button_name(index)))
+            row.set_title_lines(1)
+            row.set_subtitle_lines(1)
+            number = Gtk.Label(label=str(index), width_chars=2)
+            number.add_css_class("dim-label")
+            number.add_css_class("caption")
+            row.add_prefix(number)
+            if profile is not None and source == "global":
+                text = f"{text} · from All applications"
+            row.set_subtitle(GLib.markup_escape_text(text))
+            row.set_tooltip_text(text)
+            if (profile is not None and source != "profile") or source is None or (
+                button is not None and button.press is None and button.hold is None
+            ):
+                row.add_css_class("dim-label")
+            row.add_suffix(Gtk.Image.new_from_icon_name("go-next-symbolic"))
+            row.set_activatable(True)
+            row.connect("activated", lambda _row, number=index: self._show_spacemouse_button_dialog(number))
+            group.add(row)
+            self._sm_rows[index] = row
+
+    # Identify by pressing ----------------------------------------------------------
+
+    def _toggle_spacemouse_identify(self):
+        if self._sm_probe is not None:
+            self._stop_spacemouse_probe()
+            return
+        probe = sm.ButtonProbe(self.config.spacemouse.socket, self._on_spacemouse_pressed)
+        self._sm_probe = probe
+        self._sm_identify_row.set_title("Connecting to spacenavd… (click to cancel)")
+
+        def started(ok):
+            if self._sm_probe is not probe:
+                return
+            if not ok:
+                self._stop_spacemouse_probe()
+                self._toast("spacenavd is not reachable: install and start it first")
+                return
+            self._sm_identify_row.set_title("Press a button now… (click to cancel)")
+
+        probe.start(started)
+
+    def _stop_spacemouse_probe(self):
+        if self._sm_probe is not None:
+            self._sm_probe.stop()
+            self._sm_probe = None
+        if self._sm_identify_row is not None:
+            self._sm_identify_row.set_title("Press a SpaceMouse button…")
+
+    def _on_spacemouse_pressed(self, index):
+        if index is None:
+            self._stop_spacemouse_probe()
+            self._toast("The connection to spacenavd was lost")
+            return
+        self._stop_spacemouse_probe()
+        if not 0 <= index < sm.SPACEMOUSE_BUTTONS:
+            return
+        if index not in self._sm_rows:
+            self._sm_extra_buttons = index + 1
+            self._rebuild_spacemouse_rows()
+        row = self._sm_rows[index]
+        row.grab_focus()
+        row.add_css_class("proart-pressed")
+        GLib.timeout_add(1800, lambda: row.remove_css_class("proart-pressed") or GLib.SOURCE_REMOVE)
+        self._toast(f"Button {index} · {sm.button_name(index)}")
+
+    # The editor of one button --------------------------------------------------------
+
+    def _show_spacemouse_button_dialog(self, index):
+        """Press and hold actions of one button, for all applications or one profile."""
+        profile = self._sm_scope
+        config = self.config
+        key = str(index)
+        dialog = Adw.Dialog(
+            title=f"{sm.button_name(index)} · button {index}", content_width=560, content_height=700,
+        )
+        view = Adw.ToolbarView()
+        view.add_top_bar(Adw.HeaderBar())
+        page = Adw.PreferencesPage()
+        view.set_content(page)
+        dialog.set_child(view)
+
+        profiles = [profile] if profile is not None else list(config.profiles)
+        groups = sm.group_titles(profiles)
+        functions = sm.function_titles(profiles)
+        current, source = sm.binding(config, profile, index)
+        working = {
+            "press": copy.deepcopy(current.press) if current else None,
+            "hold": copy.deepcopy(current.hold) if current else None,
+        }
+        sections = []
+        # What was last saved: an action that is not valid yet (hold keys
+        # without keys) is not saved, the previous one stays.
+        stored = {slot: copy.deepcopy(working[slot]) for slot in working}
+
+        def commit():
+            for slot in working:
+                if sm.is_valid(working[slot]):
+                    stored[slot] = copy.deepcopy(working[slot])
+            button = SpaceMouseButton(press=copy.deepcopy(stored["press"]), hold=copy.deepcopy(stored["hold"]))
+            if profile is None:
+                sm.store_global(sm.editable_global(config), index, button)
+            else:
+                sm.store(profile.spacemouse_buttons, index, button)
+            self._spacemouse_changed()
+
+        if profile is not None:
+            scope_group = Adw.PreferencesGroup()
+
+            def override_toggled(active):
+                for section in sections:
+                    section.set_sensitive(active)
+                if active:
+                    commit()
+                else:
+                    profile.spacemouse_buttons.pop(key, None)
+                    self._spacemouse_changed()
+
+            scope_group.add(_switch_row(
+                f"Own binding for {profile.name}",
+                "Off: the button does what All applications says",
+                source == "profile", override_toggled,
+            ))
+            page.add(scope_group)
+
+        for slot, title, description in (
+            ("press", "Press", "Runs when the button goes down; a modifier stays held until it is released."),
+            ("hold", "Hold", "Runs instead when the button stays down for the long-press time."),
+        ):
+            section = self._spacemouse_action_section(
+                working, slot, title, description, groups, functions, index, commit,
+            )
+            sections.append(section)
+            page.add(section)
+        if profile is not None and source != "profile":
+            for section in sections:
+                section.set_sensitive(False)
+
+        if profile is None:
+            reset_group = Adw.PreferencesGroup()
+            reset = _button_row("Reset to default", "edit-undo-symbolic")
+
+            def reset_button(_row):
+                sm.reset_global_button(config, index)
+                self._spacemouse_changed()
+                dialog.close()
+
+            reset.connect("activated", reset_button)
+            reset_group.add(reset)
+            page.add(reset_group)
+        dialog.present(self._window)
+
+    def _spacemouse_action_section(self, working, slot, title, description, groups, functions, index, commit):
+        """One of Press / Hold: the action type and the fields of the chosen type."""
+        group = Adw.PreferencesGroup(title=title, description=description)
+        choices = [item for item in sm.supported_choices() if slot == "press" or item[0] not in sm.PRESS_ONLY]
+        choice_keys = [item[0] for item in choices]
+        type_row = Adw.ComboRow(title="Action", model=Gtk.StringList.new([label for _key, label in choices]))
+        group.add(type_row)
+        syncing = {"active": True}
+        holder = type("StepList", (), {"macro_center": [], "title": title})()
+
+        keys_row = Adw.EntryRow(title="Keys, e.g. Ctrl+Tab")
+        keys_row.set_show_apply_button(True)
+        group.add(keys_row)
+
+        steps_row = Adw.ExpanderRow(title="Sequence of actions", subtitle="Runs instead of the keys above")
+        group.add(steps_row)
+        step_rows = []
+
+        def rebuild_steps():
+            for row in step_rows:
+                steps_row.remove(row)
+            step_rows.clear()
+            for position, step in enumerate(holder.macro_center):
+                row = self._step_row(holder, "macro_center", position, step, steps_changed, f"Button {index} · {title}")
+                steps_row.add_row(row)
+                step_rows.append(row)
+            add = _button_row("Add an action", "list-add-symbolic")
+            add.connect("activated", lambda _row: self._show_step_dialog(
+                holder, "macro_center", None, steps_changed, f"Button {index} · {title}"))
+            steps_row.add_row(add)
+            step_rows.append(add)
+            steps_row.set_subtitle(
+                f"{len(holder.macro_center)} action{'s' if len(holder.macro_center) != 1 else ''}, run instead of the keys"
+                if holder.macro_center else "Optional: several actions in a row instead of one shortcut"
+            )
+
+        def steps_changed():
+            action = working[slot]
+            if action is not None and action.type == "macro":
+                action.macro = holder.macro_center
+            rebuild_steps()
+            commit()
+
+        group_row = Adw.ComboRow(title="Group")
+        function_by_row = Adw.ComboRow(title="Choose by", model=Gtk.StringList.new(["Name", "Position in the menu"]))
+        function_row = Adw.ComboRow(title="Function")
+        slot_row = Adw.SpinRow.new_with_range(1, 12, 1)
+        slot_row.set_title("Position in the menu")
+        slot_row.set_subtitle("1 is the first entry of the dial's menu; a group opens its list")
+        for row in (group_row, function_by_row, function_row, slot_row):
+            group.add(row)
+        group_names = [""] + groups
+        function_names = list(functions)
+
+        def sync_rows():
+            """Show the working action in the rows without committing."""
+            syncing["active"] = True
+            action = working[slot]
+            type_row.set_selected(max(choice_keys.index(sm.choice_of(action)) if sm.choice_of(action) in choice_keys else 0, 0))
+            keys_row.set_text(keys_to_text(action.keys) if action is not None and action.keys else "")
+            keys_row.remove_css_class("error")
+            holder.macro_center = action.macro if action is not None and action.macro is not None else []
+            rebuild_steps()
+            if action is not None and action.type == "macro":
+                steps_row.set_expanded(bool(holder.macro_center))
+            named = action.group if action is not None and action.type == "group" else None
+            names = list(group_names)
+            if named and named not in names:
+                names.append(named)
+            group_row.set_model(Gtk.StringList.new(["First group of the profile"] + names[1:]))
+            group_row.set_selected(names.index(named) if named else 0)
+            group_row._names = names
+            by_name = action is not None and action.type == "function" and action.function is not None
+            function_by_row.set_selected(0 if by_name or action is None or action.slot is None else 1)
+            chosen = action.function if by_name else None
+            fnames = list(function_names)
+            if chosen and chosen not in fnames:
+                fnames.append(chosen)
+            function_row.set_model(Gtk.StringList.new(fnames))
+            function_row.set_selected(fnames.index(chosen) if chosen else 0)
+            function_row._names = fnames
+            slot_row.set_value((action.slot if action is not None and action.slot is not None else 0) + 1)
+            show_fields()
+            syncing["active"] = False
+
+        def show_fields():
+            action = working[slot]
+            kind = action.type if action is not None else "none"
+            keys_row.set_visible(kind in ("macro", "key_hold"))
+            steps_row.set_visible(kind == "macro")
+            group_row.set_visible(kind == "group")
+            function_by_row.set_visible(kind == "function")
+            by_slot = function_by_row.get_selected() == 1
+            function_row.set_visible(kind == "function" and not by_slot)
+            slot_row.set_visible(kind == "function" and by_slot)
+            if kind == "key_hold" and not sm.is_valid(action):
+                # Not saved until it has keys: the previous action stays.
+                keys_row.set_title("Type the keys to hold, then Apply (not saved yet)")
+                keys_row.add_css_class("error")
+            else:
+                keys_row.set_title("Keys held while the button is down, e.g. Ctrl+Shift" if kind == "key_hold"
+                                   else "Keys, e.g. Ctrl+Tab")
+                keys_row.remove_css_class("error")
+
+        def type_changed(row, _param):
+            if syncing["active"]:
+                return
+            choice = choice_keys[row.get_selected()]
+            action = sm.new_action(choice, working[slot])
+            if action is not None and action.type == "function" and action.function is None and action.slot is None:
+                action.slot = 0
+            if action is not None and action.type == "macro" and action.macro is None:
+                action.macro = []
+            working[slot] = action
+            sync_rows()
+            if sm.is_valid(action):
+                commit()
+
+        def keys_applied(row):
+            action = working[slot]
+            if action is None or syncing["active"]:
+                return
+            keys, unknown = parse_keys(row.get_text())
+            if unknown:
+                row.add_css_class("error")
+                self._toast(f"Unknown key: {', '.join(unknown)}")
+                return
+            row.remove_css_class("error")
+            if action.type == "key_hold" and not keys:
+                # The previous keys stay; the row says so.
+                row.add_css_class("error")
+                self._toast("Hold keys needs at least one key")
+                return
+            action.keys = keys or None
+            show_fields()
+            commit()
+
+        def group_changed(row, _param):
+            action = working[slot]
+            if action is None or action.type != "group" or syncing["active"]:
+                return
+            names = group_row._names
+            position = row.get_selected()
+            action.group = names[position] or None if 0 <= position < len(names) else None
+            commit()
+
+        def function_changed(*_args):
+            action = working[slot]
+            if action is None or action.type != "function" or syncing["active"]:
+                return
+            if function_by_row.get_selected() == 1:
+                action.function, action.slot = None, int(slot_row.get_value()) - 1
+            else:
+                names = function_row._names
+                position = function_row.get_selected()
+                action.function = names[position] if 0 <= position < len(names) else None
+                action.slot = None if action.function else 0
+            show_fields()
+            commit()
+
+        type_row.connect("notify::selected", type_changed)
+        keys_row.connect("apply", keys_applied)
+        group_row.connect("notify::selected", group_changed)
+        function_by_row.connect("notify::selected", function_changed)
+        function_row.connect("notify::selected", function_changed)
+        slot_row.connect("notify::value", function_changed)
+        sync_rows()
+        return group
+
     def _build_diagnostics_page(self):
         content = self._page_box()
         status = Adw.PreferencesGroup(title="Driver status")
@@ -3998,11 +4548,13 @@ class Application(Adw.Application):
             status = {key: self._unpack_dbus_value(value) for key, value in status.items()}
         except (GLib.Error, RuntimeError) as error:
             rows["service"].set_subtitle(f"Unavailable: {getattr(error, 'message', error)}")
+            self._update_spacemouse_status(None)
             for key in ("enabled", "application", "profile", "function", "environment", "touchpad", "configuration"):
                 rows[key].set_subtitle("Unknown")
             return
 
         rows["service"].set_subtitle("Connected")
+        self._update_spacemouse_status(status)
         rows["enabled"].set_subtitle("On" if status.get("enabled") else "Off")
         rows["application"].set_subtitle(str(status.get("application") or "None"))
         mode = "single function" if status.get("mode") == "single" else "radial menu"
@@ -4017,6 +4569,19 @@ class Application(Adw.Application):
             dial_mode = f"Mouse-only mode · {status.get('mouse_device')}" if status.get("mouse_device") else "Mouse-only mode"
         else:
             dial_mode = f"{'Touchpad mode' if status.get('emulation') else 'DialPad mode'} · {status.get('touchpad') or 'unknown'}"
+        if self.config.spacemouse.enabled or status.get("spacemouse"):
+            device = status.get("spacemouse_device")
+            if status.get("spacemouse"):
+                extra = f"SpaceMouse mode · {device}" if device else "SpaceMouse mode"
+            elif status.get("emulation") and not status.get("mouse"):
+                extra = "SpaceMouse mode (ignored next to Touchpad mode)"
+            elif status.get("touchpad") and not status.get("mouse"):
+                extra = "SpaceMouse mode (not connected, or ignored next to a touchpad)"
+            else:
+                extra = "SpaceMouse mode (not connected)"
+            alone = not status.get("mouse") and not status.get("emulation") and (
+                status.get("spacemouse") or not status.get("touchpad"))
+            dial_mode = extra if alone else f"{dial_mode} + {extra}"
         rows["touchpad"].set_subtitle(dial_mode)
         rows["configuration"].set_subtitle(self._configuration_state(status))
         max_x, max_y = int(status.get("touchpad_max_x") or 0), int(status.get("touchpad_max_y") or 0)
