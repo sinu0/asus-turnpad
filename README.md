@@ -1,4 +1,4 @@
-# Turnpad — a dial for ASUS DialPads, any touchpad, a mouse or a 3Dconnexion SpaceMouse
+# Turnpad — turn anything into a dial: DialPad, touchpad, mouse or SpaceMouse
 
 Turnpad turns the DialPad printed on the touchpad of ASUS laptops — or any other touchpad, a mouse or a 3Dconnexion SpaceMouse — into an ASUS Dial-style controller on Linux: a radial menu of functions, per-application profiles, an on-screen dial with skins and a settings app.
 
