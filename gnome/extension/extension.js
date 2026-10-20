@@ -68,6 +68,9 @@ export default class DialPadExtension extends Extension {
         this._signalId = 0;
         this._detailsSignalId = 0;
         this._focusHandlerId = 0;
+        // The focused window whose title is followed (SetActiveWindow).
+        this._titleWindow = null;
+        this._titleHandlerId = 0;
         this._monitorsId = 0;
         // The monitor the dial is on and the pointer on it ([x, y] from its
         // corner) when the dial appeared; kept until it is fully hidden.
@@ -621,6 +624,19 @@ export default class DialPadExtension extends Extension {
             global.display.disconnect(this._focusHandlerId);
             this._focusHandlerId = 0;
         }
+        this._disconnectTitle();
+    }
+
+    _disconnectTitle() {
+        if (this._titleWindow && this._titleHandlerId) {
+            try {
+                this._titleWindow.disconnect(this._titleHandlerId);
+            } catch (e) {
+                // The window is gone.
+            }
+        }
+        this._titleWindow = null;
+        this._titleHandlerId = 0;
     }
 
     _mergeDetails(json) {
@@ -675,10 +691,42 @@ export default class DialPadExtension extends Extension {
     }
 
     _onFocusWindow() {
+        this._disconnectTitle();
         const focusWindow = global.display?.focus_window;
         const tracker = Shell.WindowTracker?.get_default();
         const app = focusWindow && tracker ? tracker.get_window_app(focusWindow) : null;
         const appId = app?.get_id() || '';
+        this._sendActiveWindow(appId, focusWindow?.get_title() || '');
+        if (focusWindow) {
+            // The driver picks a profile context by the title, which changes
+            // while the window stays (a document name, a browser tab).
+            this._titleWindow = focusWindow;
+            this._titleHandlerId = focusWindow.connect('notify::title', () =>
+                this._sendActiveWindow(appId, focusWindow.get_title() || ''));
+        }
+    }
+
+    _sendActiveWindow(appId, windowTitle) {
+        Gio.DBus.session.call(
+            BUS_NAME, BUS_PATH, BUS_IFACE, 'SetActiveWindow',
+            new GLib.Variant('(ss)', [appId, windowTitle]), null,
+            Gio.DBusCallFlags.NONE, -1, null,
+            (connection, result) => {
+                try {
+                    connection.call_finish(result);
+                } catch (error) {
+                    // An older driver has only SetActiveApplication (no title).
+                    try {
+                        if (error.matches(Gio.DBusError, Gio.DBusError.UNKNOWN_METHOD))
+                            this._sendActiveApplication(appId);
+                    } catch (_) {
+                        // Driver not running: the next focus change tries again.
+                    }
+                }
+            });
+    }
+
+    _sendActiveApplication(appId) {
         Gio.DBus.session.call(
             BUS_NAME, BUS_PATH, BUS_IFACE, 'SetActiveApplication',
             new GLib.Variant('(s)', [appId]), null,

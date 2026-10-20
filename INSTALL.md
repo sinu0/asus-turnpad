@@ -46,6 +46,27 @@ exec systemctl --user import-environment WAYLAND_DISPLAY && systemctl --user sta
 
 Logs: `journalctl --user -u asus-turnpad-overlay`. It shows on the output that has focus; `/usr/bin/python3 /opt/asus-turnpad/overlay/layer_shell.py --output eDP-1` (or `/usr/share/asus-turnpad/...` for the packages) pins it to one.
 
+### SpaceMouse mode
+
+A 3Dconnexion SpaceMouse (tested: SpacePilot Pro) needs `spacenavd`, the free driver for these devices. Turnpad is one more client of it and needs no library, so it is optional and none of the packages or `install.sh` pulls it in. Install it from your distribution and start it once:
+
+| Distribution | Package |
+| --- | --- |
+| Arch, CachyOS | `spacenavd` from the AUR (`yay -S spacenavd`) |
+| Fedora, Debian, Ubuntu | `spacenavd` (`sudo dnf install spacenavd`, `sudo apt install spacenavd`) |
+
+```bash
+sudo systemctl enable --now spacenavd
+```
+
+Then switch SpaceMouse mode on in the app (the first-run assistant does it when it finds the device, or the *SpaceMouse* page) and let it restart the driver. The mode works on a computer without a touchpad, alone or together with Mouse-only mode; with a DialPad or Touchpad mode it is ignored for now. Everything about the buttons, the cap and the screen is in [SPACEMOUSE.md](SPACEMOUSE.md).
+
+**Blender:** for Turnpad to run Blender's own commands (and to read its mode), Blender needs the Turnpad add-on. The *SpaceMouse* page of the settings app has a *Blender* group with *Install the Blender add-on*: it builds the add-on from the program directory (`integrations/blender/turnpad`) and installs it into your Blender with `blender --command extension`, or, without Blender on the `PATH` or when that fails, writes a zip and shows how to install it from Edit › Preferences › Get Extensions › Install from Disk. Nothing is installed system-wide.
+
+### The screen of a SpacePilot Pro
+
+A 3Dconnexion SpacePilot Pro (USB `046d:c629`) has a small screen that shows Turnpad's keys, dial and clock. It needs the optional package `pyusb` (`python-pyusb` on Arch, `python3-usb` on Debian and Ubuntu, `python3-pyusb` on Fedora and openSUSE); `install.sh` installs it when the distribution has it, the Arch, Debian and Fedora packages list it as optional or recommended. The user service `asus-turnpad-screen.service` starts by itself when the device is plugged in (the udev rule for USB `046d:c629` is installed with the other rules, by `install.sh` and by every package), needs no enabling, and stops quietly when pyusb or the device is missing. Logs: `journalctl --user -u asus-turnpad-screen`.
+
 ## Arch package
 
 ```bash
@@ -67,7 +88,8 @@ What the package installs:
 | `/usr/share/gnome-shell/extensions/asus-turnpad@sinu0.github.io` | The on-screen dial for GNOME |
 | `/usr/lib/systemd/user/asus-turnpad.service` | The driver as a user service (enabled per user by `asus-turnpad-setup`) |
 | `/usr/lib/systemd/user/asus-turnpad-overlay.service` | The on-screen dial on Wayland desktops other than GNOME (enabled per user by `asus-turnpad-setup`) |
-| `/usr/lib/udev/rules.d/70-asus-turnpad.rules` | Access to uinput, the I2C buses and the DialPad touchpad's hidraw node for the logged-in user |
+| `/usr/lib/systemd/user/asus-turnpad-screen.service` | The screen of a SpacePilot Pro (started by udev when the device is plugged in; needs `python-pyusb`) |
+| `/usr/lib/udev/rules.d/70-asus-turnpad.rules` | Access to uinput, the I2C buses, the DialPad touchpad's hidraw node and a SpacePilot Pro for the logged-in user |
 | `/usr/lib/modules-load.d/asus-turnpad.conf`, `/usr/lib/sysusers.d/asus-turnpad.conf` | Kernel modules `uinput` and `i2c-dev`; groups `i2c` and `uinput` |
 | `/usr/bin/asus-turnpad-setup` | The per-user setup above |
 
@@ -159,7 +181,8 @@ Where things go follows the Filesystem Hierarchy Standard for software installed
 | `~/.config/asus-turnpad` | `config.json`, `skins/`, driver state `dialpad_dev` |
 | `~/.config/systemd/user/asus-turnpad.service` | The driver as a user service, started with the graphical session |
 | `~/.local/share/gnome-shell/extensions/asus-turnpad@sinu0.github.io` | The on-screen dial for GNOME |
-| `/etc/udev/rules.d/70-asus-turnpad-*.rules`, `/etc/modules-load.d/asus-turnpad.conf` | Access to the touchpad's I2C and hidraw nodes and to uinput; kernel modules loaded at boot |
+| `~/.config/systemd/user/asus-turnpad-screen.service` | The screen of a SpacePilot Pro, started by its udev rule |
+| `/etc/udev/rules.d/70-asus-turnpad-*.rules`, `/etc/modules-load.d/asus-turnpad.conf` | Access to the touchpad's I2C and hidraw nodes, to uinput and to a SpacePilot Pro; kernel modules loaded at boot |
 | `/var/log/asus-turnpad` | Logs of the installer and uninstaller |
 
 ### Running parts of the installer

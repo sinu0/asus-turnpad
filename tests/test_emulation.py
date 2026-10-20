@@ -118,6 +118,7 @@ def load_switching(emulation):
     noop = staticmethod(lambda *a, **k: None)
     namespace = {
         "emulation": emulation,
+        "touchpad_free": False,
         "dialpad": False,
         "pending_calibration": None,
         "driver_state_lock": __import__("threading").RLock(),

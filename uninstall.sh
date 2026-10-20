@@ -19,7 +19,7 @@ echo
 LOGS_UNINSTALL_LOG_FILE_PATH="$LOGS_DIR_PATH/uninstall-$(date +"%d-%m-%Y-%H-%M-%S").log"
 
 {
-    for unit in "$OVERLAY_SERVICE" "$UI_SERVICE" "$DRIVER_SERVICE"; do
+    for unit in "$SCREEN_SERVICE" "$OVERLAY_SERVICE" "$UI_SERVICE" "$DRIVER_SERVICE"; do
         if systemctl --user cat "$unit" >/dev/null 2>&1; then
             systemctl --user disable --now "$unit" && echo "Stopped and disabled $unit"
         fi
@@ -35,11 +35,11 @@ LOGS_UNINSTALL_LOG_FILE_PATH="$LOGS_DIR_PATH/uninstall-$(date +"%d-%m-%Y-%H-%M-%
 
     sudo rm -rf "$INSTALL_DIR_PATH" && echo "Removed $INSTALL_DIR_PATH"
 
-    sudo rm -f "$UDEV_RULE_UINPUT" "$UDEV_RULE_I2C" "$UDEV_RULE_HIDRAW" "$MODULES_LOAD_FILE_PATH"
+    sudo rm -f "$UDEV_RULE_UINPUT" "$UDEV_RULE_I2C" "$UDEV_RULE_HIDRAW" "$UDEV_RULE_SCREEN" "$MODULES_LOAD_FILE_PATH"
 
     remove_legacy_install
 
-    if sudo udevadm control --reload-rules && sudo udevadm trigger --sysname-match=uinput && sudo udevadm trigger --subsystem-match=hidraw; then
+    if sudo udevadm control --reload-rules && sudo udevadm trigger --sysname-match=uinput && sudo udevadm trigger --subsystem-match=hidraw && sudo udevadm trigger --subsystem-match=usb --attr-match=idVendor=046d --attr-match=idProduct=c629; then
         echo "Udev rules reloaded and triggered"
     else
         echo "Something went wrong when reloading or triggering udev rules"

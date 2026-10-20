@@ -3,7 +3,7 @@
 # Distribution packages Turnpad needs. Everything comes from the package
 # manager and runs with the system Python ($PYTHON): no Python environment,
 # no pip, no compiler. Sourced by install.sh, install_service.sh,
-# install_user_interface.sh and install_layer_shell_overlay.sh.
+# install_user_interface.sh, install_layer_shell_overlay.sh and install_screen.sh.
 #
 #   detect_package_manager      sets PACKAGE_MANAGER (empty when unknown)
 #   packages <group>            package names of a group for this manager
@@ -30,6 +30,9 @@
 #   layershell gtk4-layer-shell and its typelib: the on-screen dial on Wayland
 #              desktops other than GNOME (overlay/layer_shell.py, see
 #              install_layer_shell_overlay.sh); Ubuntu 24.04 has none
+#   screen     pyusb: the screen of a 3Dconnexion SpacePilot Pro (screen/,
+#              see install_screen.sh); install.sh installs it with the
+#              optional packages
 #
 # Names for apt, dnf and pacman are tested in CI (tests/install_in_container.sh,
 # packaging/arch); zypper names were checked on openSUSE Tumbleweed only;
@@ -53,6 +56,7 @@ PACKAGES_apt_x11libs="python3-xlib python3-xcffib"
 PACKAGES_apt_systemd="python3-systemd"
 PACKAGES_apt_ui="python3-pyside6.qtcore python3-pyside6.qtgui python3-pyside6.qtwidgets python3-pyside6.qtsvg"
 PACKAGES_apt_layershell="gir1.2-gtk4layershell-1.0 libgtk4-layer-shell0"
+PACKAGES_apt_screen="python3-usb"
 
 # Fedora, also immutable Fedora (rpm-ostree) and yum; gobject-introspection
 # has the cairo and DBus typelibs that GTK, Rsvg and pyatspi load.
@@ -66,6 +70,7 @@ PACKAGES_dnf_x11libs="python3-xlib python3-xcffib"
 PACKAGES_dnf_systemd="python3-systemd"
 PACKAGES_dnf_ui="python3-pyside6"
 PACKAGES_dnf_layershell="gtk4-layer-shell"
+PACKAGES_dnf_screen="python3-pyusb"
 
 # Arch Linux (the Arch package in packaging/arch is the better way there)
 PACKAGES_pacman_required="python python-libevdev python-gobject python-cairo libxkbcommon i2c-tools
@@ -78,6 +83,7 @@ PACKAGES_pacman_x11libs="python-xlib python-xcffib"
 PACKAGES_pacman_systemd="python-systemd"
 PACKAGES_pacman_ui="pyside6"
 PACKAGES_pacman_layershell="gtk4-layer-shell"
+PACKAGES_pacman_screen="python-pyusb"
 
 # openSUSE
 PACKAGES_zypper_required="python3 python3-libevdev python3-gobject python3-gobject-cairo python3-cairo libxkbcommon0 i2c-tools
@@ -90,6 +96,7 @@ PACKAGES_zypper_x11libs="python3-python-xlib python3-xcffib"
 PACKAGES_zypper_systemd="python3-systemd"
 PACKAGES_zypper_ui="python3-pyside6"
 PACKAGES_zypper_layershell="typelib-1_0-Gtk4LayerShell-1_0 libgtk4-layer-shell0"
+PACKAGES_zypper_screen="python3-pyusb"
 
 # Void Linux (not tested)
 PACKAGES_xbps_required="python3 python3-libevdev python3-gobject python3-cairo libxkbcommon i2c-tools
@@ -102,6 +109,7 @@ PACKAGES_xbps_x11libs="python3-xlib python3-xcffib"
 PACKAGES_xbps_systemd=""
 PACKAGES_xbps_ui="python3-pyside6"
 PACKAGES_xbps_layershell="gtk4-layer-shell"
+PACKAGES_xbps_screen="python3-pyusb"
 
 # Gentoo (not tested)
 PACKAGES_portage_required="dev-lang/python dev-python/libevdev dev-python/pygobject dev-python/pycairo x11-libs/libxkbcommon sys-apps/i2c-tools
@@ -114,6 +122,7 @@ PACKAGES_portage_x11libs="dev-python/python-xlib dev-python/xcffib"
 PACKAGES_portage_systemd="dev-python/python-systemd"
 PACKAGES_portage_ui="dev-python/pyside"
 PACKAGES_portage_layershell="gui-libs/gtk4-layer-shell"
+PACKAGES_portage_screen="dev-python/pyusb"
 
 # Solus (not tested)
 PACKAGES_eopkg_required="python3 python-libevdev python-gobject python-cairo libxkbcommon i2c-tools
@@ -126,6 +135,7 @@ PACKAGES_eopkg_x11libs="python-xlib python-xcffib"
 PACKAGES_eopkg_systemd="python-systemd"
 PACKAGES_eopkg_ui="pyside6"
 PACKAGES_eopkg_layershell="gtk4-layer-shell"
+PACKAGES_eopkg_screen="python-pyusb"
 
 detect_package_manager() {
     PACKAGE_MANAGER=""

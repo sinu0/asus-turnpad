@@ -38,3 +38,20 @@ The dial in its main states: the radial menu, a level gauge, an endless function
 | Skins page: gallery, light and dark choice, on-screen dial | Skin editor with a live preview |
 | ![Drawing an outline](./preview/settings-skin-shape.png) | ![Group editor](./preview/settings-group-editor.png) |
 | Drawing your own outline | A group: its list as on screen and its functions |
+| ![SpaceMouse page](./preview/settings-spacemouse.png) | ![Screen page](./preview/settings-screen.png) |
+| SpaceMouse: the device, buttons with press and hold actions, layers, cap motion | The SpacePilot Pro's screen: preview, look, power, pages |
+| ![Setup assistant](./preview/settings-setup-assistant.png) | |
+| First start: what was found and which modes to use | |
+
+## SpacePilot Pro screen
+
+The colour screen of a 3Dconnexion SpacePilot Pro shows Turnpad (`screen/`, user service `asus-turnpad-screen.service`; settings on the *Screen* page; guide: [SPACEMOUSE.md](SPACEMOUSE.md#the-spacepilot-pros-screen)). Pictures drawn by `tools/render_screen_preview.py` with the code that drives the panel; the demo is a Blender profile whose buttons carry labels.
+
+| | |
+|---|---|
+| ![Keys page](./preview/screen-keys.png) | ![Dial page](./preview/screen-dial.png) |
+| Function keys 1–5: the action of the short press and of the long press | The live dial, steered with the screen's keys |
+| ![All buttons](./preview/screen-device.png) | ![Motion](./preview/screen-motion.png) |
+| Every button of the active application (dimmed: the application's own) | Live cap: six axes, tilt and twist |
+| ![Clock](./preview/screen-clock.png) | |
+| Clock and status | |

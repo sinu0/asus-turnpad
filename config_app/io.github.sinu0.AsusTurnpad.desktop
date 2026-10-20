@@ -1,8 +1,8 @@
 [Desktop Entry]
 Name=Turnpad
-GenericName=Touchpad dial settings
-Comment=Configure the touchpad dial of ASUS laptops: functions, application profiles and skins
-Keywords=DialPad;dial;touchpad;ASUS;
+GenericName=Dial settings
+Comment=Configure the dial of an ASUS DialPad, a touchpad, a mouse or a 3Dconnexion SpaceMouse: functions, application profiles, buttons and skins
+Keywords=DialPad;dial;touchpad;ASUS;SpaceMouse;3Dconnexion;SpacePilot;spacenav;mouse;
 Exec=python3 @INSTALL_DIR@/config_app/main.py
 Icon=io.github.sinu0.AsusTurnpad
 Terminal=false

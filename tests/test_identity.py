@@ -43,6 +43,13 @@ class IdentityTest(unittest.TestCase):
         self.assertEqual(shell_value("INSTALL_DIR_PATH"), identity.INSTALL_DIR)
         self.assertTrue(shell_value("CONFIG_FILE_DIR_PATH").endswith(f"/{identity.CONFIG_DIR_NAME}"))
         self.assertEqual(shell_value("OVERLAY_SERVICE"), identity.OVERLAY_SERVICE)
+        self.assertEqual(shell_value("SCREEN_SERVICE"), identity.SCREEN_SERVICE)
+
+    def test_app_link_socket_twin_in_the_blender_add_on(self):
+        text = read("integrations/blender/turnpad/protocol.py")
+        self.assertIn(f'SOCKET_NAME = "{identity.APP_LINK_SOCKET_NAME}"', text)
+        self.assertEqual(identity.app_link_socket_path({"XDG_RUNTIME_DIR": "/run/user/7"}), f"/run/user/7/{identity.APP_LINK_SOCKET_NAME}")
+        self.assertIsNone(identity.app_link_socket_path({}))
 
     def test_no_script_overrides_the_paths(self):
         # Defaults live in install_paths.sh only, so they cannot drift apart.
@@ -81,6 +88,12 @@ class IdentityTest(unittest.TestCase):
         self.assertTrue((ROOT / identity.OVERLAY_SERVICE).exists())
         self.assertIn(f"{identity.PACKAGE_DIR}/overlay/layer_shell.py", read(f"packaging/{identity.OVERLAY_SERVICE}"))
         self.assertIn('"packaging/$OVERLAY_SERVICE" "$ROOT/usr/lib/systemd/user/$OVERLAY_SERVICE"', files)
+        # The SpacePilot Pro's screen: started by the udev rule, which names the same unit.
+        self.assertTrue((ROOT / identity.SCREEN_SERVICE).exists())
+        self.assertIn(f"{identity.PACKAGE_DIR}/screen/service.py", read(f"packaging/{identity.SCREEN_SERVICE}"))
+        self.assertIn('"packaging/$SCREEN_SERVICE" "$ROOT/usr/lib/systemd/user/$SCREEN_SERVICE"', files)
+        self.assertIn(f'SYSTEMD_USER_WANTS}}+="{identity.SCREEN_SERVICE}"', read(f"packaging/70-{identity.SLUG}.rules"))
+        self.assertIn(f'UDEV_RULE_SCREEN="$INSTALL_UDEV_DIR_PATH/rules.d/70-$SLUG-screen.rules"', read("install_paths.sh"))
         self.assertIn(identity.INSTALL_DIR, setup)
         self.assertIn(f"[ -d {identity.PACKAGE_DIR} ]", read("install.sh"))
 

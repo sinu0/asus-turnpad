@@ -9,6 +9,7 @@ if [ "$1" = configure ]; then
     if command -v udevadm >/dev/null 2>&1; then
         udevadm control --reload-rules 2>/dev/null || true
         udevadm trigger --subsystem-match=misc --subsystem-match=i2c-dev --subsystem-match=hidraw 2>/dev/null || true
+        udevadm trigger --subsystem-match=usb --attr-match=idVendor=046d --attr-match=idProduct=c629 2>/dev/null || true
     fi
     modprobe -a uinput i2c-dev 2>/dev/null || true
 

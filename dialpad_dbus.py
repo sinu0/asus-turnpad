@@ -45,6 +45,19 @@ INTERFACE_XML = f"""<node>
     <method name="SetActiveApplication">
       <arg direction="in" type="s" name="application"/>
     </method>
+    <!-- The focused window: its application id and title (a KWin script or
+         the Shell extension); SetActiveApplication is the same without a title. -->
+    <method name="SetActiveWindow">
+      <arg direction="in" type="s" name="application"/>
+      <arg direction="in" type="s" name="title"/>
+    </method>
+    <!-- The commands the linked application (the Blender add-on) offers, as JSON:
+         app, name, version, connected, context, commands[]. The argument is the
+         link's application name or a desktop id. -->
+    <method name="GetAppCommands">
+      <arg direction="in" type="s" name="application"/>
+      <arg direction="out" type="s"/>
+    </method>
     <method name="GetStatus">
       <arg direction="out" type="a{{sv}}"/>
     </method>
@@ -52,6 +65,16 @@ INTERFACE_XML = f"""<node>
       <arg direction="out" type="b"/>
     </method>
     <method name="StartCalibration">
+      <arg direction="out" type="b"/>
+    </method>
+    <!-- The driver's state as JSON (what DriverState last carried). -->
+    <method name="GetDriverState">
+      <arg direction="out" type="s"/>
+    </method>
+    <!-- A dial command from another program (grammar: parse_control());
+         true when it was understood, not when it changed anything. -->
+    <method name="Control">
+      <arg direction="in" type="s" name="command"/>
       <arg direction="out" type="b"/>
     </method>
     <!-- Switch the dial on or off, as holding the corner icon does. -->
@@ -74,12 +97,40 @@ INTERFACE_XML = f"""<node>
     <signal name="OverlayDetails">
       <arg type="s" name="details_json"/>
     </signal>
+    <!-- Profile, application, dial, group, function, held keys and the
+         SpaceMouse connection as JSON; sent when the text changes. -->
+    <signal name="DriverState">
+      <arg type="s" name="state_json"/>
+    </signal>
     <!-- Guided calibration state as JSON (step, message, error, result…). -->
     <signal name="CalibrationProgress">
       <arg type="s" name="state_json"/>
     </signal>
   </interface>
 </node>"""
+
+# What GetDriverState answers before the driver has published anything.
+_EMPTY_DRIVER_STATE = {
+    "profile": "",
+    "app": "",
+    "dial": False,
+    "mode": "multi",
+    "group": "",
+    "function": "",
+    "modifiers": [],
+    "keys_held": [],
+    "spacemouse": False,
+    "spacemouse_device": "",
+    "config_revision": "",
+    # The app link: the focused application has a connected add-on, its
+    # context ({mode, label, detail} or {}), the profile context in force,
+    # a ready profile on offer (pack name) and the last notice ({id, text}).
+    "app_link": False,
+    "app_context": {},
+    "context": "",
+    "suggest": "",
+    "notice": {},
+}
 
 NODE_INFO = Gio.DBusNodeInfo.new_for_xml(INTERFACE_XML)
 INTERFACE_INFO = NODE_INFO.lookup_interface(INTERFACE_NAME)
@@ -101,6 +152,57 @@ _BOOL_METHODS = {
 
 LOG = logging.getLogger(__name__)
 
+CONTROL_ROTATE_MAX = 10
+CONTROL_MAX_LENGTH = 200
+CONTROL_BUTTON_MAX = 1023
+CONTROL_MUTE_MAX = 5000
+_CONTROL_PLAIN = ("toggle", "dial-on", "dial-off", "select", "back", "group")
+
+
+def parse_control(text: Any) -> tuple[str, Any] | None:
+    """Read a Control command into ``(verb, argument)``; None when it is not one.
+
+    ``toggle``, ``dial-on``, ``dial-off``, ``select``, ``back``, ``group`` (the
+    first group; argument None), ``group=TITLE``, ``rotate:N`` (N from -10 to
+    10 except 0, clockwise when positive), ``function:N`` (menu slot from 0,
+    verb ``function``), ``function=TITLE`` (verb ``function-title``),
+    ``button:INDEX`` (a SpaceMouse button's press action, INDEX 0 to 1023),
+    ``mute:MS`` (silence the other spacenavd clients for MS milliseconds, 0 to
+    5000, 0 ends it; a lease, not a queued command).
+    Verbs are lower case, surrounding blanks are ignored.
+    """
+    if not isinstance(text, str):
+        return None
+    text = text.strip()
+    if not text or len(text) > CONTROL_MAX_LENGTH:
+        return None
+    if text in _CONTROL_PLAIN:
+        return (text, None)
+    # The first ':' or '=' separates; a title may hold either.
+    name = text.split(":", 1)[0].split("=", 1)[0]
+    separator = text[len(name):len(name) + 1]
+    value = text[len(name) + 1:].strip()
+    if separator == ":":
+        # int() would also take "1_0", "٣" and "+3"; digits and a sign only.
+        digits = value[1:] if value[:1] in "+-" else value
+        if name not in ("rotate", "function", "button", "mute") or not (digits.isascii() and digits.isdigit()):
+            return None
+        number = int(value)
+        if name == "rotate":
+            if number == 0 or abs(number) > CONTROL_ROTATE_MAX:
+                return None
+        elif number < 0 or (name == "button" and number > CONTROL_BUTTON_MAX) or (
+            name == "mute" and number > CONTROL_MUTE_MAX
+        ):
+            return None
+        return (name, number)
+    if separator == "=" and value:
+        if name == "function":
+            return ("function-title", value)
+        if name == "group":
+            return ("group", value)
+    return None
+
 
 class DialPadDBusService:
     """Owns the DialPad session service and its private GLib main-loop thread."""
@@ -113,8 +215,16 @@ class DialPadDBusService:
         status_provider: Callable[[], Mapping[str, Any]],
         on_cancel_calibration: Callable[[], Any] | None = None,
         on_toggle: Callable[[], Any] | None = None,
+        on_control: Callable[[str], Any] | None = None,
+        driver_state_provider: Callable[[], Mapping[str, Any]] | None = None,
+        on_active_window: Callable[[str, str], Any] | None = None,
+        on_app_commands: Callable[[str], str] | None = None,
     ) -> None:
+        self._on_active_window = on_active_window
+        self._on_app_commands = on_app_commands
+        self._driver_state_provider = driver_state_provider
         self._on_cancel_calibration = on_cancel_calibration
+        self._on_control = on_control
         self._on_toggle = on_toggle
         self._on_active_application = on_active_application
         self._on_reload_config = on_reload_config
@@ -141,6 +251,8 @@ class DialPadDBusService:
             "value_show_only_progress": False,
             "touching": False,
         }
+        # The last DriverState text: the signal is sent only when it changes.
+        self._driver_state_json = json.dumps(_EMPTY_DRIVER_STATE, sort_keys=True)
         # Extra presentation data kept outside the fixed OverlayState
         # signature so that older Shell extensions keep working.
         self._details: dict[str, Any] = {
@@ -287,6 +399,50 @@ class DialPadDBusService:
             GLib.idle_add(self._emit_overlay_state, connection, values, details_json)
         except Exception:
             LOG.exception("Failed to schedule the DialPad overlay state signal")
+
+    def emit_driver_state(self, state: Mapping[str, Any]) -> bool:
+        """Remember the driver state and schedule a DriverState signal when it
+        differs from the last one. True when a signal was scheduled. Cheap, and
+        never waits for the bus: the emit runs in the GLib thread."""
+        try:
+            text = json.dumps(dict(state), sort_keys=True)
+        except (TypeError, ValueError):
+            LOG.warning("Dropping non-serialisable driver state")
+            return False
+        with self._lock:
+            if text == self._driver_state_json:
+                return False
+            self._driver_state_json = text
+            connection = self._connection if self._started else None
+        if connection is None:
+            return False
+
+        def emit() -> bool:
+            if self._is_current(connection):
+                try:
+                    self._emit_signal(connection, "DriverState", GLib.Variant("(s)", (text,)))
+                except Exception:
+                    LOG.exception("Failed to emit the driver state signal")
+            return GLib.SOURCE_REMOVE
+
+        try:
+            GLib.idle_add(emit)
+        except Exception:
+            LOG.exception("Failed to schedule the driver state signal")
+            return False
+        return True
+
+    def _driver_state_text(self) -> str:
+        """The answer to GetDriverState: a snapshot taken now, else the last
+        published one. Not remembered: only emit_driver_state decides what the
+        signal has told the subscribers."""
+        if self._driver_state_provider is not None:
+            try:
+                return json.dumps(dict(self._driver_state_provider()), sort_keys=True)
+            except Exception:
+                LOG.exception("Failed to read the live driver state")
+        with self._lock:
+            return self._driver_state_json
 
     def emit_calibration_progress(self, state: Mapping[str, Any]) -> None:
         with self._lock:
@@ -442,10 +598,20 @@ class DialPadDBusService:
             if method_name == "SetActiveApplication":
                 self._set_active_application(str(parameters.unpack()[0]))
                 reply = None
+            elif method_name == "SetActiveWindow":
+                application, window_title = parameters.unpack()
+                self._set_active_window(str(application), str(window_title))
+                reply = None
+            elif method_name == "GetAppCommands":
+                reply = GLib.Variant("(s)", (self._app_commands(str(parameters.unpack()[0])),))
             elif method_name == "GetStatus":
                 reply = GLib.Variant("(a{sv})", (self._get_status(),))
             elif method_name == "GetOverlayDetails":
                 reply = GLib.Variant("(s)", (self._details_json(),))
+            elif method_name == "GetDriverState":
+                reply = GLib.Variant("(s)", (self._driver_state_text(),))
+            elif method_name == "Control":
+                reply = GLib.Variant("(b)", (self._control(str(parameters.unpack()[0])),))
             elif method_name in _BOOL_METHODS:
                 callback = getattr(self, _BOOL_METHODS[method_name])
                 reply = GLib.Variant("(b)", (self._call_bool_callback(callback, method_name),))
@@ -469,6 +635,36 @@ class DialPadDBusService:
             callback(application)
         except Exception:
             LOG.exception("SetActiveApplication callback failed")
+
+    def _set_active_window(self, application: str, title: str) -> None:
+        callback = self._on_active_window
+        if callback is None:
+            return
+        try:
+            callback(application, title)
+        except Exception:
+            LOG.exception("SetActiveWindow callback failed")
+
+    def _app_commands(self, application: str) -> str:
+        """The JSON catalog of a linked application; without a link server an empty one."""
+        callback = self._on_app_commands
+        if callback is not None:
+            try:
+                return str(callback(application))
+            except Exception:
+                LOG.exception("GetAppCommands callback failed")
+        return json.dumps({"app": application, "name": "", "version": "", "connected": False,
+                           "context": {}, "commands": []})
+
+    def _control(self, command: str) -> bool:
+        callback = self._on_control
+        if callback is None:
+            return False
+        try:
+            return bool(callback(command))
+        except Exception:
+            LOG.exception("Control callback failed")
+            return False
 
     def _call_bool_callback(self, callback: Callable[[], Any] | None, name: str) -> bool:
         if callback is None:

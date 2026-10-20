@@ -211,6 +211,11 @@ def describe_step(step: MacroStep) -> str:
         return "Command"
     if step.type is StepType.DELAY:
         return f"Wait {step.duration or 0:g} s"
+    if step.type is StepType.APP:
+        # The application's command; the shortcut it falls back to is the better hint.
+        if step.keys:
+            return format_keys(step.keys)
+        return (step.command or "").rsplit(".", 1)[-1].replace("_", " ").capitalize()
     return step.type.value.replace("_", " ").title()
 
 

@@ -41,6 +41,8 @@ for path in \
     /usr/share/icons/hicolor/scalable/apps/io.github.sinu0.AsusTurnpad.svg \
     /usr/lib/systemd/user/asus-turnpad.service \
     /usr/lib/systemd/user/asus-turnpad-overlay.service \
+    /usr/lib/systemd/user/asus-turnpad-screen.service "$APP/screen/__init__.py" \
+    "$APP/app_link.py" "$APP/integrations/blender/turnpad/blender_manifest.toml" "$APP/integrations/blender/turnpad/__init__.py" \
     /usr/lib/udev/rules.d/70-asus-turnpad.rules \
     /usr/lib/modules-load.d/asus-turnpad.conf \
     /usr/lib/sysusers.d/asus-turnpad.conf \
@@ -50,6 +52,10 @@ for path in \
 done
 grep -q "Exec=python3 $APP/config_app/main.py" /usr/share/applications/io.github.sinu0.AsusTurnpad.desktop
 grep -qx "ExecStart=/usr/bin/python3 $APP/overlay/layer_shell.py" /usr/lib/systemd/user/asus-turnpad-overlay.service
+grep -qx "ExecStart=/usr/bin/python3 $APP/screen/service.py" /usr/lib/systemd/user/asus-turnpad-screen.service
+# No [Install] section: the udev rule starts the screen service when the SpacePilot Pro is plugged in.
+if grep -q "^\[Install\]" /usr/lib/systemd/user/asus-turnpad-screen.service; then echo "screen unit has an [Install] section"; exit 1; fi
+grep -q "SYSTEMD_USER_WANTS.*asus-turnpad-screen.service" /usr/lib/udev/rules.d/70-asus-turnpad.rules
 getent group i2c >/dev/null && getent group uinput >/dev/null
 test -x "$APP/dialpad.py" && test -x /usr/bin/asus-turnpad-setup
 # The user services must not be enabled for every user (asus-turnpad-setup does it per user).

@@ -45,6 +45,12 @@ GNOME_EXTENSION_UUID = "asus-turnpad@sinu0.github.io"
 # packaging/asus-turnpad-setup, the unit files <OVERLAY_SERVICE>.
 OVERLAY_SERVICE = f"{SLUG}-overlay.service"
 
+# User service of the SpaceMouse screen (screen/service.py): started by the
+# udev rule of the device, not enabled. Twins: install_paths.sh, the unit
+# files <SCREEN_SERVICE>, UDEV_RULE_SCREEN in install_user_groups.sh and
+# packaging/70-asus-turnpad.rules.
+SCREEN_SERVICE = f"{SLUG}-screen.service"
+
 # Twin: install_paths.sh.
 INSTALL_DIR = "/opt/asus-turnpad"
 
@@ -54,6 +60,22 @@ PACKAGE_DIR = f"/usr/share/{SLUG}"
 
 # Socket for the legacy PySide overlay, in $XDG_RUNTIME_DIR.
 SOCKET_NAME = f"{SLUG}.sock"
+
+
+# Socket of the app link in $XDG_RUNTIME_DIR: applications (the Blender add-on)
+# tell the driver their commands and context and run commands on request.
+# Twin: SOCKET_NAME in integrations/blender/turnpad/protocol.py.
+APP_LINK_SOCKET_NAME = f"{SLUG}-apps.sock"
+
+
+def app_link_socket_path(environ=None):
+    """$XDG_RUNTIME_DIR/asus-turnpad-apps.sock; None without a runtime directory
+    (no fallback to /tmp: the socket must live in a private directory)."""
+    import os
+
+    environ = os.environ if environ is None else environ
+    runtime_dir = environ.get("XDG_RUNTIME_DIR")
+    return os.path.join(runtime_dir, APP_LINK_SOCKET_NAME) if runtime_dir else None
 
 
 def socket_path() -> str:

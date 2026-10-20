@@ -57,6 +57,7 @@ class MacroExecutor:
         run_program: Callable[[str, list[str]], None],
         run_shell: Callable[[str], None],
         sleep: Callable[[float], None],
+        run_app: Callable[[str, list[str]], None] | None = None,
     ) -> None:
         self.send_keys = send_keys
         self.scroll = scroll
@@ -66,6 +67,9 @@ class MacroExecutor:
         self.run_program = run_program
         self.run_shell = run_shell
         self.sleep = sleep
+        # run_app(command id, fallback keys): through the app link; without it
+        # an app step presses its fallback keys.
+        self.run_app = run_app
 
     def execute(self, steps: list[MacroStep]) -> None:
         for step in steps:
@@ -108,6 +112,13 @@ class MacroExecutor:
             self.run_program(self._program(step), self._args(step))
         elif step.type is StepType.SHELL:
             self.run_shell(self._script(step))
+        elif step.type is StepType.APP:
+            command = self._command(step)
+            keys = list(step.keys) if step.keys else []
+            if self.run_app is not None:
+                self.run_app(command, keys)
+            elif keys:
+                self.send_keys(self._keys(step))
         else:
             raise MacroExecutionError(f"Unsupported macro step type: {step.type!r}")
 
@@ -169,6 +180,12 @@ class MacroExecutor:
         ):
             raise MacroExecutionError("command requires string args")
         return step.args
+
+    @staticmethod
+    def _command(step: MacroStep) -> str:
+        if not isinstance(step.command, str) or not step.command:
+            raise MacroExecutionError("app requires a command")
+        return step.command
 
     @staticmethod
     def _script(step: MacroStep) -> str:

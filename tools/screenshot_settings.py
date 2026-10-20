@@ -29,6 +29,7 @@ from gi.repository import Adw, Gdk, Gio, GLib, Graphene, Gtk  # noqa: E402
 
 from config.presets import apps_group, pack_for_app, profile_for_pack  # noqa: E402
 from config.schema import _default_config  # noqa: E402
+from config_app import key_capture  # noqa: E402
 from config.skins import builtin_skins  # noqa: E402
 
 OUTPUT = Path(sys.argv[1]) if len(sys.argv) > 1 else ROOT / "preview"
@@ -60,7 +61,45 @@ def demo_config():
     config.profiles = profiles
     # Shows the light and dark badges in the skin gallery.
     config.overlay.follow_system_style = True
+    # No setup assistant over the pictures.
+    config.setup_done = True
     return config
+
+
+# /proc/bus/input/devices of the demo laptop: two mice with a wheel.
+DEMO_DEVICES = """I: Bus=0003 Vendor=046d Product=4085 Version=0111
+N: Name="Logitech G604 "
+H: Handlers=sysrq kbd leds event2 mouse0
+B: EV=12001f
+B: KEY=3f00733fff 0 0 483ffff17aff32d bfd4444600000000 ffff0001 130ff38b17d007 ffff7bfad9415fff ffbeffdfffefffff fffffffffffffffe
+B: REL=1943
+
+I: Bus=0003 Vendor=1234 Product=0001 Version=0111
+N: Name="USB Optical Mouse"
+H: Handlers=mouse1 event3
+B: EV=17
+B: KEY=1f0000 0 0 0 0
+B: REL=903
+"""
+
+
+def demo_hardware():
+    """A computer that has everything (a DialPad, mice, a SpacePilot Pro), whatever
+    machine the pictures or the layout probe run on, and no files written."""
+    hardware = app_main.hw
+    hardware.input_devices_text = lambda: DEMO_DEVICES
+    hardware.detect = lambda **_arguments: hardware.Detected(
+        product="ProArt PX13", vendor="ASUSTeK COMPUTER INC.", dialpad="ASCF1A00:00 2808:0220 Touchpad",
+        layout="proartp16", mice=tuple(hardware.list_mice(DEMO_DEVICES)), spacenav_socket="/var/run/spnav.sock",
+        spacemice=((0x046D, 0xC629, "SpacePilot PRO"),), screens=("SpacePilot Pro",),
+    )
+    hardware.load_app_settings = lambda path=None: {"show_all_pages": True}
+    # The mouse's event nodes cannot be read: the key capture listens to its own window.
+    def unreadable(node):
+        raise PermissionError(node)
+
+    key_capture.open_node = unreadable
+    hardware.save_app_settings = lambda settings, path=None: True
 
 
 class ScreenshotApp(app_main.Application):
@@ -202,8 +241,43 @@ def steps(app):
     yield
     yield from capture(window, "settings-skin-shape")
 
+    # The pictures of the SpaceMouse features, added last so the ones before
+    # stay as they were.
+    blender = _blender_profile()
+    config.profiles.append(blender)
+    app._changed()
+    yield
+    app._refresh_spacemouse_page()
+    app.edit_context_buttons(blender)
+    yield from page("spacemouse", (WIDTH, 1168))
+    yield
+    yield from capture(window, "settings-spacemouse")
+
+    app._screen_scope = blender
+    app._refresh_screen_page()
+    yield from page("screen", (WIDTH, 1000))
+    yield
+    yield
+    yield from capture(window, "settings-screen")
+
+    yield from page("actions")
+    app._select_profile(default)
+    config.setup_done = False
+    app._show_setup_assistant()
+    yield
+    yield
+    yield from capture(window, "settings-setup-assistant")
+
     close_dialogs(app)
     app.quit()
+
+
+def _blender_profile():
+    """The advanced Blender pack with the labelled buttons of the screen pictures."""
+    sys.path.insert(0, str(ROOT / "tools"))
+    import render_screen_preview
+
+    return render_screen_preview.demo_config()[1]
 
 
 def _descendants(widget, kind):
@@ -222,6 +296,7 @@ def main():
     app_main.CONFIG_FILE = Path(__file__)
     app_main.load_config = lambda: demo
     app_main.load_skins = builtin_skins
+    demo_hardware()
     Adw.init()
     app = ScreenshotApp()
     # Run beside an open settings app instead of activating it.

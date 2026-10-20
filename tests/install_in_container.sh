@@ -76,15 +76,23 @@ done
 
 echo "== files"
 for path in "$APP/dialpad.py" "$APP/layout_detect.py" "$APP/config_app/main.py" "$APP/gnome/extension/skins.json" \
-    "$HOME_DIR/.config/systemd/user/asus-turnpad.service" \
+    "$HOME_DIR/.config/systemd/user/asus-turnpad.service" "$HOME_DIR/.config/systemd/user/asus-turnpad-screen.service" \
+    "$APP/screen/__init__.py" "$APP/spacemouse_devices.py" "$APP/app_link.py" \
+    "$APP/integrations/blender/turnpad/blender_manifest.toml" \
     "$HOME_DIR/.local/share/applications/io.github.sinu0.AsusTurnpad.desktop" \
-    /etc/udev/rules.d/70-asus-turnpad-i2c-dev.rules /etc/modules-load.d/asus-turnpad.conf; do
+    /etc/udev/rules.d/70-asus-turnpad-i2c-dev.rules /etc/udev/rules.d/70-asus-turnpad-screen.rules /etc/modules-load.d/asus-turnpad.conf; do
     test -e "$path" || { echo "missing: $path"; exit 1; }
 done
 grep -q "ExecStart=$PY $APP/dialpad.py proartp16 $HOME_DIR/.config/asus-turnpad/" \
     "$HOME_DIR/.config/systemd/user/asus-turnpad.service" \
     || { grep ExecStart "$HOME_DIR/.config/systemd/user/asus-turnpad.service"; echo "the service does not run $PY"; exit 1; }
 id -nG "$TESTER" | tr ' ' '\n' | grep -qx input
+# The SpacePilot Pro's screen: a unit with no [Install] section, started by the udev rule.
+grep -qx "ExecStart=$PY $APP/screen/service.py" "$HOME_DIR/.config/systemd/user/asus-turnpad-screen.service" \
+    || { cat "$HOME_DIR/.config/systemd/user/asus-turnpad-screen.service"; echo "the screen's service is wrong"; exit 1; }
+! grep -q "^\[Install\]" "$HOME_DIR/.config/systemd/user/asus-turnpad-screen.service" || { echo "the screen's service has an [Install] section"; exit 1; }
+grep -q 'ATTR{idProduct}=="c629".*SYSTEMD_USER_WANTS}+="asus-turnpad-screen.service"' /etc/udev/rules.d/70-asus-turnpad-screen.rules \
+    || { cat /etc/udev/rules.d/70-asus-turnpad-screen.rules; echo "the screen's udev rule is wrong"; exit 1; }
 # GNOME has the Shell extension; no layer-shell dial.
 test ! -e "$UNITS/asus-turnpad-overlay.service" || { echo "layer-shell dial installed on GNOME"; exit 1; }
 
@@ -140,9 +148,9 @@ EOF
 
 echo "== uninstall.sh"
 as_tester "bash uninstall.sh" > /tmp/uninstall.log 2>&1 || { tail -30 /tmp/uninstall.log; echo "uninstall.sh failed"; exit 1; }
-for path in "$APP" "$HOME_DIR/.config/systemd/user/asus-turnpad.service" \
+for path in "$APP" "$HOME_DIR/.config/systemd/user/asus-turnpad.service" "$HOME_DIR/.config/systemd/user/asus-turnpad-screen.service" \
     "$HOME_DIR/.local/share/applications/io.github.sinu0.AsusTurnpad.desktop" \
-    /etc/udev/rules.d/70-asus-turnpad-i2c-dev.rules /etc/modules-load.d/asus-turnpad.conf; do
+    /etc/udev/rules.d/70-asus-turnpad-i2c-dev.rules /etc/udev/rules.d/70-asus-turnpad-screen.rules /etc/modules-load.d/asus-turnpad.conf; do
     test ! -e "$path" || { echo "left behind: $path"; exit 1; }
 done
 test -d "$HOME_DIR/.config/asus-turnpad" || { echo "settings were removed"; exit 1; }
@@ -175,7 +183,7 @@ else
     echo "gtk4-layer-shell is not packaged here: the dial is left out"
 fi
 as_tester "bash uninstall.sh" > /tmp/uninstall-sway.log 2>&1 || { tail -30 /tmp/uninstall-sway.log; echo "uninstall.sh failed"; exit 1; }
-for path in "$APP" "$UNITS/asus-turnpad.service" "$UNITS/asus-turnpad-overlay.service"; do
+for path in "$APP" "$UNITS/asus-turnpad.service" "$UNITS/asus-turnpad-overlay.service" "$UNITS/asus-turnpad-screen.service"; do
     test ! -e "$path" || { echo "left behind: $path"; exit 1; }
 done
 echo "== install test passed"

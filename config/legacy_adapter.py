@@ -1,12 +1,27 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 from config.labels import GROUP_ICON, describe_macro
 from config.presets import segment_color
-from config.schema import MODIFIER_KEYS, DialPadConfig, MacroStep, Profile, Segment, _default_config
+from config.schema import (
+    MODIFIER_KEYS,
+    DialPadConfig,
+    MacroStep,
+    Profile,
+    Segment,
+    _default_config,
+    merge_spacemouse_buttons,
+    merge_spacemouse_layers,
+)
 
 # Profile-level settings travel in a reserved key that the driver never
 # mistakes for a radial-menu function.
 META_KEY = "_meta"
+# A profile's contexts (window title / application mode variants), each with a
+# complete shortcut set of its own: [{"context": ProfileContext, "shortcuts": {...}}].
+# Reserved like META_KEY, so the driver never takes it for a function.
+CONTEXTS_KEY = "_contexts"
 
 
 def _legacy_trigger(macro: list[MacroStep], title: str, modifier: str | None = None) -> list[dict]:
@@ -77,7 +92,7 @@ def _legacy_group(group: Segment, index: int) -> dict:
 
 
 def _profile_meta(profile: Profile) -> dict:
-    return {
+    meta = {
         "name": profile.name,
         "mode": profile.mode,
         "sensitivity": profile.sensitivity,
@@ -85,6 +100,13 @@ def _profile_meta(profile: Profile) -> dict:
         "remember_last": profile.remember_last,
         "overlay": dict(profile.overlay),
     }
+    if profile.spacemouse_buttons:
+        meta["spacemouse_buttons"] = dict(profile.spacemouse_buttons)
+    if profile.spacemouse_layers:
+        meta["spacemouse_layers"] = {name: dict(buttons) for name, buttons in profile.spacemouse_layers.items()}
+    if profile.spacemouse_motion:
+        meta["spacemouse_motion"] = dict(profile.spacemouse_motion)
+    return meta
 
 
 def _profile_shortcuts(profile: Profile) -> dict | None:
@@ -128,20 +150,84 @@ def _profile_shortcuts(profile: Profile) -> dict | None:
     }
 
 
+def _buttons_only_shortcuts(profile: Profile, base: dict) -> dict:
+    """A profile without functions that binds SpaceMouse buttons or sets screen
+    pages: the dial keeps showing the default profile's menu (``base``), the
+    profile's name and buttons are the ones in force while its application has focus."""
+    shortcuts = dict(base)
+    meta = dict(base.get(META_KEY) or {})
+    # What the base menu's profile sets for itself (buttons, layers, motion, screen,
+    # the context in force) is not this profile's; its own are laid over below.
+    for key in ("spacemouse_buttons", "spacemouse_layers", "spacemouse_motion", "screen", "context", "contexts"):
+        meta.pop(key, None)
+    meta.update(_profile_meta(profile))
+    shortcuts[META_KEY] = meta
+    return shortcuts
+
+
+def _context_entries(profile: Profile, base: dict) -> list[dict]:
+    """One shortcut set per context of ``profile`` (``base`` = the profile's own).
+    A context with its own menu gets that menu; otherwise it keeps the profile's.
+    Its SpaceMouse buttons and layers are laid over the profile's, its screen
+    overrides over the profile's; ``_meta["context"]`` names it."""
+    entries = []
+    for context in profile.contexts:
+        if not context.has_conditions():
+            continue
+        shortcuts = None
+        if context.segments is not None:
+            shortcuts = _profile_shortcuts(replace(profile, segments=context.segments, contexts=[]))
+        if shortcuts is None:
+            shortcuts = {key: value for key, value in base.items() if key != CONTEXTS_KEY}
+            shortcuts[META_KEY] = dict(base.get(META_KEY) or {})
+        meta = shortcuts[META_KEY]
+        meta["context"] = context.name
+        buttons = merge_spacemouse_buttons(profile.spacemouse_buttons, context.spacemouse_buttons)
+        layers = merge_spacemouse_layers(profile.spacemouse_layers, context.spacemouse_layers)
+        screen = {**profile.screen, **context.screen}
+        for key, value in (("spacemouse_buttons", buttons), ("spacemouse_layers", layers), ("screen", screen)):
+            if value:
+                meta[key] = value
+            else:
+                meta.pop(key, None)
+        entries.append({"context": context, "shortcuts": shortcuts})
+    return entries
+
+
+def shortcuts_for_context(shortcuts: dict, window_title, app_mode) -> tuple[str, dict]:
+    """(context name, shortcut set) in force for a profile's ``shortcuts``: the
+    first context whose conditions hold for the window title and the application
+    mode, else ("", shortcuts)."""
+    for entry in shortcuts.get(CONTEXTS_KEY) or []:
+        if entry["context"].matches(window_title, app_mode):
+            return entry["context"].name, entry["shortcuts"]
+    return "", shortcuts
+
+
 def shortcuts_from_config(config: DialPadConfig) -> dict:
     shortcuts = {}
     first_populated = None
+    buttons_only = []
+    # (profile, the shortcut set that is its own) for attaching the contexts at the end.
+    placed = []
     for profile in config.profiles:
         profile_shortcuts = _profile_shortcuts(profile)
-        # An unfinished application profile must fall back to the default one.
+        # An unfinished application profile must fall back to the default one,
+        # unless it only exists for its SpaceMouse buttons, screen pages or contexts.
         if profile_shortcuts is None:
+            if (profile.spacemouse_buttons or profile.spacemouse_layers or profile.spacemouse_motion
+                    or profile.screen or profile.contexts):
+                buttons_only.append(profile)
             continue
         if first_populated is None:
             first_populated = profile_shortcuts
         if profile.app_id is None:
             shortcuts.setdefault("none", profile_shortcuts)
+            if shortcuts["none"] is profile_shortcuts:
+                placed.append((profile, profile_shortcuts))
         else:
             shortcuts[profile.app_id] = profile_shortcuts
+            placed.append((profile, profile_shortcuts))
 
     if "none" not in shortcuts:
         shortcuts["none"] = (
@@ -149,6 +235,19 @@ def shortcuts_from_config(config: DialPadConfig) -> dict:
             if first_populated is not None
             else {"center": [], "clockwise": [], "counterclockwise": []}
         )
+    for profile in buttons_only:
+        if profile.app_id is None:
+            # The default profile with buttons only: the first menu that exists, with its buttons.
+            shortcuts["none"] = _buttons_only_shortcuts(profile, shortcuts["none"])
+            placed.append((profile, shortcuts["none"]))
+        else:
+            shortcuts[profile.app_id] = _buttons_only_shortcuts(profile, shortcuts["none"])
+            placed.append((profile, shortcuts[profile.app_id]))
+    # Last, so that no copy of a profile's set above carries its contexts.
+    for profile, own in placed:
+        entries = _context_entries(profile, own)
+        if entries:
+            own[CONTEXTS_KEY] = entries
     return shortcuts
 
 

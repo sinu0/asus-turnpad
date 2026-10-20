@@ -1,0 +1,17 @@
+schema_version = "1.0.0"
+
+id = "turnpad"
+version = "1.0.0"
+name = "Turnpad"
+tagline = "Run Blender commands from a Turnpad dial or SpaceMouse button"
+maintainer = "Turnpad"
+type = "add-on"
+
+blender_version_min = "4.2.0"
+
+license = [
+  "SPDX:GPL-3.0-or-later",
+]
+
+[permissions]
+files = "Talks to the Turnpad driver through a socket in the runtime dir"

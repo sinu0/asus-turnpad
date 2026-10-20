@@ -74,6 +74,12 @@ fi
 
 sudo mkdir -p /etc/modules-load.d
 
+# every file written below is checked on its own
+rule_write_failed() {
+    echo "Something went wrong during adding the $1 (uinput, i2c-dev modules to auto loaded modules or the associated udev rules)"
+    exit 1
+}
+
 # autodetects KERNEL and SUBSYSTEM values for /dev/uinput
 read UINPUT_KERNEL UINPUT_SUBSYSTEM < <(
     udevadm info --attribute-walk --name=/dev/uinput \
@@ -98,14 +104,14 @@ echo "  i2c:    SUBSYSTEM=$I2C_SUBSYSTEM"
 
 # create uinput udev rule
 echo 'SUBSYSTEM=="'"$UINPUT_SUBSYSTEM"'", KERNEL=="'"$UINPUT_KERNEL"'", OPTIONS+="static_node=uinput", GROUP="uinput", MODE="0660"' \
-  | sudo tee "$UDEV_RULE_UINPUT" >/dev/null
+  | sudo tee "$UDEV_RULE_UINPUT" >/dev/null || rule_write_failed "uinput udev rule"
 
 # create i2c udev rule
 echo 'ACTION!="remove", KERNEL=="i2c-[0-9]*", SUBSYSTEM=="'"$I2C_SUBSYSTEM"'", TAG+="uaccess", GROUP="i2c", MODE="0660"' \
-  | sudo tee "$UDEV_RULE_I2C" >/dev/null
+  | sudo tee "$UDEV_RULE_I2C" >/dev/null || rule_write_failed "i2c udev rule"
 
 # load uinput and i2c-dev at boot
-printf 'uinput\ni2c-dev\n' | sudo tee "$MODULES_LOAD_FILE_PATH" >/dev/null
+printf 'uinput\ni2c-dev\n' | sudo tee "$MODULES_LOAD_FILE_PATH" >/dev/null || rule_write_failed "modules-load file"
 
 # create hidraw udev rule (hidraw node of the touchpad is the preferred way how to control
 # the DialPad backlight, I2C above is used as a fallback)
@@ -118,17 +124,18 @@ TOUCHPAD_PHYS=$(grep -A5 -i touchpad /proc/bus/input/devices | grep -o 'Phys=i2c
 
 if [ -n "$TOUCHPAD_PHYS" ]; then
     echo 'ACTION!="remove", SUBSYSTEM=="hidraw", KERNELS=="'"$TOUCHPAD_PHYS"'", TAG+="uaccess", GROUP="i2c", MODE="0660"' \
-      | sudo tee "$UDEV_RULE_HIDRAW" >/dev/null
+      | sudo tee "$UDEV_RULE_HIDRAW" >/dev/null || rule_write_failed "hidraw udev rule"
 else
     echo "Touchpad Phys not detected, skipping adding hidraw udev rule"
 fi
 
-if [[ $? != 0 ]]; then
-    echo "Something went wrong during adding uinput, i2c-dev modules to auto loaded modules or during adding associated udev rules"
-    exit 1
-fi
+# the screen of a 3Dconnexion SpacePilot Pro (USB 046d:c629): uaccess lets the logged-in user open it,
+# SYSTEMD_USER_WANTS makes the user's service manager start $SCREEN_SERVICE while the device is present
+# (the unit itself is placed by install_screen.sh); packaging/70-asus-turnpad.rules has the same rule
+echo 'ACTION!="remove", SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="046d", ATTR{idProduct}=="c629", TAG+="uaccess", TAG+="systemd", ENV{SYSTEMD_USER_WANTS}+="'"$SCREEN_SERVICE"'"' \
+  | sudo tee "$UDEV_RULE_SCREEN" >/dev/null || rule_write_failed "screen udev rule"
 
-sudo udevadm control --reload-rules && sudo udevadm trigger --sysname-match=uinput && sudo udevadm trigger --attr-match=subsystem=i2c-dev && sudo udevadm trigger --subsystem-match=hidraw
+sudo udevadm control --reload-rules && sudo udevadm trigger --sysname-match=uinput && sudo udevadm trigger --attr-match=subsystem=i2c-dev && sudo udevadm trigger --subsystem-match=hidraw && sudo udevadm trigger --subsystem-match=usb --attr-match=idVendor=046d --attr-match=idProduct=c629
 
 if [[ $? != 0 ]]; then
     echo "Something went wrong when reloading or triggering uinput udev rules"

@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from typing import Callable
 
 from config.labels import GROUP_ICON
-from config.schema import MacroStep, Profile, Segment, StepType
+from config.schema import MacroStep, Profile, Segment, SpaceMouseAction, SpaceMouseButton, StepType
 
 VOLUME_QUERY = "pactl get-sink-volume @DEFAULT_SINK@ | grep -oP '\\d+%' | head -n 1 | tr -d '%'"
 BRIGHTNESS_QUERY = "brightnessctl -m | cut -d, -f4 | tr -d '%'"
@@ -413,6 +413,53 @@ def blender_profile_segments() -> list[Segment]:
     ]
 
 
+def _sequence(title: str, *presses: str) -> list[MacroStep]:
+    """A key sequence such as FreeCAD's "V, F": one keystroke per press."""
+    return [keys(press, title=title if index == 0 else None) for index, press in enumerate(presses)]
+
+
+def _tap_sequence(title, presses, *, color, icon=None):
+    """An action-only function whose tap presses several keys one after the other."""
+    segment = _segment(title, [], [], _sequence(title, *presses), color=color)
+    segment.icon_url = icon
+    return segment
+
+
+# FreeCAD 1.x (src/Gui/CommandView.cpp, src/Mod/Sketcher/Gui/Command*.cpp
+# accelerators): Ctrl++ / Ctrl+- zoom (QKeySequence::ZoomIn / ZoomOut, sent as
+# the keypad keys), Shift+Left / Shift+Right turn the view by 90 degrees, 0 is
+# the isometric view, V, F fits all, D dimensions in a sketch, H and C
+# constrain horizontal and coincident.
+def freecad_profile_segments() -> list[Segment]:
+    zoom = _turn("Zoom", ("Zoom in", CTRL, "KEY_KPPLUS"), ("Zoom out", CTRL, "KEY_KPMINUS"), color=COLORS["zoom"])
+    zoom.macro_center = _sequence("Fit all", "KEY_V", "KEY_F")
+    return [
+        zoom,
+        _turn("Rotate view", ("Rotate right", SHIFT, "KEY_RIGHT"), ("Rotate left", SHIFT, "KEY_LEFT"),
+              ("Isometric view", "KEY_0"), color=COLORS["navigate"], treshold=90),
+        _turn("Constraint", ("Horizontal", "KEY_H"), ("Coincident", "KEY_C"),
+              ("Dimension", "KEY_D"), color=COLORS["brush"], treshold=90),
+        undo_redo([CTRL, "KEY_Y"]),
+    ]
+
+
+# KiCad 9 (common/tool/actions.cpp, pcbnew/tools/pcb_actions.cpp, Linux
+# defaults): F1 / F2 zoom in / out, Home fits, N / Shift+N change the grid,
+# R / Shift+R rotate, F flips (PCB editor), + / - switch the layer, Ctrl+Y redoes.
+def kicad_profile_segments() -> list[Segment]:
+    return [
+        _turn("Zoom", ("Zoom in", "KEY_F1"), ("Zoom out", "KEY_F2"),
+              ("Fit to screen", "KEY_HOME"), color=COLORS["zoom"]),
+        _turn("Grid", ("Next grid", "KEY_N"), ("Previous grid", SHIFT, "KEY_N"),
+              color=COLORS["navigate"], treshold=45),
+        _turn("Rotate", ("Rotate clockwise", SHIFT, "KEY_R"), ("Rotate counter-clockwise", "KEY_R"),
+              ("Flip to the other side", "KEY_F"), color=COLORS["brush"], treshold=45),
+        _turn("Layer", ("Next layer", SHIFT, "KEY_EQUAL"), ("Previous layer", "KEY_MINUS"),
+              color=COLORS["layers"], treshold=60),
+        undo_redo([CTRL, "KEY_Y"]),
+    ]
+
+
 # Kdenlive 24/25
 def kdenlive_profile_segments() -> list[Segment]:
     return [
@@ -752,6 +799,81 @@ def blender_advanced_segments() -> list[Segment]:
     ]
 
 
+# FreeCAD 1.x: V, O / V, P orthographic / perspective, V, S fits the
+# selection, Home is the home view; sketcher: G, L line, G, M polyline, G, R
+# rectangle, G, C circle, G, A arc, G, T trim (all need the sketch open).
+def freecad_advanced_segments() -> list[Segment]:
+    basic = freecad_profile_segments()
+    views = _group("Views", [
+        _tap("Isometric", ("Isometric view", "KEY_0"), color=COLORS["navigate"], icon="view-reveal-symbolic"),
+        _tap("Home view", ("Home view", "KEY_HOME"), color=COLORS["navigate"], icon="go-next-symbolic"),
+        _tap_sequence("Fit all", ("KEY_V", "KEY_F"), color=COLORS["zoom"], icon="view-reveal-symbolic"),
+        _tap_sequence("Fit selection", ("KEY_V", "KEY_S"), color=COLORS["zoom"], icon="view-reveal-symbolic"),
+        _tap_sequence("Orthographic", ("KEY_V", "KEY_O"), color=COLORS["light"], icon="camera-video-symbolic"),
+        _tap_sequence("Perspective", ("KEY_V", "KEY_P"), color=COLORS["light"], icon="camera-video-symbolic"),
+    ], icon="camera-video-symbolic")
+    sketch = _group("Sketch", [
+        _tap_sequence("Line", ("KEY_G", "KEY_L"), color=COLORS["brush"], icon="document-edit-symbolic"),
+        _tap_sequence("Polyline", ("KEY_G", "KEY_M"), color=COLORS["brush"], icon="document-edit-symbolic"),
+        _tap_sequence("Rectangle", ("KEY_G", "KEY_R"), color=COLORS["brush"], icon="document-edit-symbolic"),
+        _tap_sequence("Circle", ("KEY_G", "KEY_C"), color=COLORS["brush"], icon="document-edit-symbolic"),
+        _tap_sequence("Arc", ("KEY_G", "KEY_A"), color=COLORS["brush"], icon="document-edit-symbolic"),
+        _tap_sequence("Trim", ("KEY_G", "KEY_T"), color=COLORS["cut"], icon="edit-cut-symbolic"),
+    ], icon="document-edit-symbolic")
+    constrain = _group("Constrain", [
+        _tap("Dimension", ("Dimension", "KEY_D"), color=COLORS["light"], icon="starred-symbolic"),
+        _tap("Horizontal", ("Horizontal constraint", "KEY_H"), color=COLORS["navigate"], icon="go-next-symbolic"),
+        _tap("Vertical", ("Vertical constraint", "KEY_V"), color=COLORS["navigate"], icon="go-up-symbolic"),
+        _tap("Coincident", ("Coincident constraint", "KEY_C"), color=COLORS["layers"], icon="view-list-symbolic"),
+    ], icon="starred-symbolic")
+    return [
+        _look(basic[0], VIEW),  # Zoom
+        _look(basic[1], VIEW),  # Rotate view
+        views,
+        sketch,
+        constrain,
+        basic[3],  # Undo / Redo
+    ]
+
+
+# KiCad 9: W / Shift+W next / previous track width, ' and \ via size, X routes
+# a single track, 6 a differential pair, B / Ctrl+B fill / unfill the zones,
+# ` highlights the net, ~ clears it, U selects the connection, M moves,
+# G drags, E opens the properties. Flip, routing and zones are PCB editor only.
+def kicad_advanced_segments() -> list[Segment]:
+    basic = kicad_profile_segments()
+    edit = _group("Edit", [
+        _tap("Move", ("Move", "KEY_M"), color=COLORS["navigate"], icon="go-next-symbolic"),
+        _tap("Drag", ("Drag", "KEY_G"), color=COLORS["navigate"], icon="go-next-symbolic"),
+        _tap("Properties", ("Properties", "KEY_E"), color=COLORS["light"], icon="document-edit-symbolic"),
+        basic[2],  # Rotate (tap flips)
+    ], icon="document-edit-symbolic")
+    route = _group("Route", [
+        _tap("Route track", ("Route a single track", "KEY_X"), color=COLORS["record"], icon="list-add-symbolic"),
+        _tap("Route pair", ("Route a differential pair", "KEY_6"), color=COLORS["record"], icon="list-add-symbolic"),
+        _turn("Track width", ("Next track width", "KEY_W"), ("Previous track width", SHIFT, "KEY_W"),
+              color=COLORS["brush"], treshold=60),
+        _turn("Via size", ("Larger via", "KEY_APOSTROPHE"), ("Smaller via", "KEY_BACKSLASH"),
+              color=COLORS["brush"], treshold=60),
+        _tap("Fill zones", ("Fill all zones", "KEY_B"), color=COLORS["navigate"], icon="color-select-symbolic"),
+        _tap("Unfill zones", ("Unfill all zones", CTRL, "KEY_B"), color=COLORS["history"], icon="edit-clear-symbolic"),
+    ], icon="list-add-symbolic")
+    nets = _group("Nets", [
+        _tap("Highlight net", ("Highlight the net", "KEY_GRAVE"), color=COLORS["light"], icon="starred-symbolic"),
+        _tap("Clear highlight", ("Clear the highlight", SHIFT, "KEY_GRAVE"), color=COLORS["history"], icon="edit-clear-symbolic"),
+        _tap("Select connection", ("Select the connection", "KEY_U"), color=COLORS["layers"], icon="view-list-symbolic"),
+    ], icon="starred-symbolic")
+    return [
+        _look(basic[0], VIEW),  # Zoom
+        _look(basic[1], CANVAS),  # Grid
+        basic[3],  # Layer
+        edit,
+        route,
+        nets,
+        basic[4],  # Undo / Redo
+    ]
+
+
 # Kdenlive 25 (src/mainwindow_actions.cpp): Alt+Left/Right snap points,
 # Ctrl+Left/Right markers, G adds or removes a timeline marker, Shift+R cuts
 # the clip at the playhead, V / B insert / overwrite the zone, Z lifts,
@@ -1057,6 +1179,208 @@ def file_manager_advanced_segments() -> list[Segment]:
     ]
 
 
+# --- SpaceMouse buttons -----------------------------------------------------
+#
+# The SpacePilot Pro keys, by raw index (spacemouse_devices.py): 1 Fit, view
+# keys 2 Top, 3 Left (long R), 4 Right, 5 Front, 6 Bottom (long T), 7 Back
+# (long F), 8 Roll cw, 9 Roll ccw (long Roll), 10 ISO 1, 11 ISO 2 (long ISO),
+# function keys 12-16 (short) and 17-21 (long press, the device tells them
+# apart), Esc / Alt / Shift / Ctrl 22-25. Packs bind the function keys with a
+# press action each (a long press may hold keys for a pie menu), the view keys
+# where the application has shortcuts of its own, and leave the rest to the
+# global map. Menu (0) stays the dial. Labels are for the device's screen.
+
+
+def _press(label: str, *names: str) -> SpaceMouseButton:
+    """A button that presses one key chord."""
+    return SpaceMouseButton(press=SpaceMouseAction("macro", keys=list(names)), label=label)
+
+
+def _hold(label: str, *names: str) -> SpaceMouseButton:
+    """A button that holds the keys while it is down (a Blender pie menu)."""
+    return SpaceMouseButton(press=SpaceMouseAction("key_hold", keys=list(names)), label=label)
+
+
+def _presses(label: str, *chords: tuple[str, ...]) -> SpaceMouseButton:
+    """A button that presses several chords one after the other ("V, F")."""
+    return SpaceMouseButton(press=SpaceMouseAction("macro", macro=[keys(*chord) for chord in chords]), label=label)
+
+
+def _pass_through() -> SpaceMouseButton:
+    """Leave the button to the application, which reads the 3D mouse itself."""
+    return SpaceMouseButton(press=SpaceMouseAction("none"))
+
+
+def _function_keys(*pairs: tuple[SpaceMouseButton, SpaceMouseButton]) -> dict[str, SpaceMouseButton]:
+    """(short, long) of the five function keys: indexes 12-16 and 17-21."""
+    buttons = {}
+    for number, (short, long) in enumerate(pairs):
+        buttons[str(12 + number)] = short
+        buttons[str(17 + number)] = long
+    return buttons
+
+
+# Blender 5.2 (keymap_data/blender_default.py), the map of the user's hand-tuned
+# profile. Blender reads Fit, the view keys and Roll (and Esc, Alt, Shift, Ctrl,
+# + and -) from spacenavd itself, so they pass through; its NDOF Menu panel is
+# why hide_buttons is wanted with Menu as the dial. ISO 1 / 2 are unbound in
+# Blender: camera view (Num0) and camera to view (Ctrl+Alt+Num0). Pie menus
+# are opened by holding their key.
+def blender_spacemouse_buttons() -> dict[str, SpaceMouseButton]:
+    buttons = {str(index): _pass_through() for index in (*range(1, 10), 22, 23, 24, 25, 29, 30)}
+    buttons["10"] = _press("Camera view", "KEY_KP0")
+    buttons["11"] = _press("Camera to view", CTRL, ALT, "KEY_KP0")
+    buttons.update(_function_keys(
+        (_press("Edit mode", "KEY_TAB"), _hold("Mode pie", CTRL, "KEY_TAB")),
+        (_press("Persp / Ortho", "KEY_KP5"), _hold("View pie", "KEY_GRAVE")),
+        (_press("Add", SHIFT, "KEY_A"), _hold("Snap pie", SHIFT, "KEY_S")),
+        (_press("X-ray", ALT, "KEY_Z"), _hold("Shading pie", "KEY_Z")),
+        (_press("Search", "KEY_F3"), _press("Maximize", CTRL, "KEY_SPACE")),
+    ))
+    return buttons
+
+
+# FreeCAD 1.x (src/Gui/CommandView.cpp, Mod/Sketcher/Gui/Command*.cpp). Its
+# 3Dconnexion button map is empty until the user loads a model in Customize >
+# Spaceball Buttons, so the view keys press FreeCAD's own view shortcuts
+# (1 front, 2 top, 3 right, 4 rear, 5 bottom, 6 left, 0 isometric, V, F fit
+# all, V, S fit the selection, Shift+Left / Right turn the view). The
+# sketcher keys (G, L line ...) need an open sketch; H horizontal, C coincident.
+def freecad_spacemouse_buttons() -> dict[str, SpaceMouseButton]:
+    buttons = {
+        "1": _presses("Fit all", ("KEY_V",), ("KEY_F",)),
+        "2": _press("Top", "KEY_2"),
+        "3": _press("Left", "KEY_6"),
+        "4": _press("Right", "KEY_3"),
+        "5": _press("Front", "KEY_1"),
+        "6": _press("Bottom", "KEY_5"),
+        "7": _press("Rear", "KEY_4"),
+        "8": _press("Rotate right", SHIFT, "KEY_RIGHT"),
+        "9": _press("Rotate left", SHIFT, "KEY_LEFT"),
+        "10": _press("Isometric", "KEY_0"),
+        "11": _presses("Fit selection", ("KEY_V",), ("KEY_S",)),
+    }
+    buttons.update(_function_keys(
+        (_presses("Line", ("KEY_G",), ("KEY_L",)), _presses("Arc", ("KEY_G",), ("KEY_A",))),
+        (_presses("Rectangle", ("KEY_G",), ("KEY_R",)), _presses("Circle", ("KEY_G",), ("KEY_C",))),
+        (_press("Dimension", "KEY_D"), _presses("Trim", ("KEY_G",), ("KEY_T",))),
+        (_press("Horizontal", "KEY_H"), _press("Coincident", "KEY_C")),
+        (_presses("Orthographic", ("KEY_V",), ("KEY_O",)), _presses("Perspective", ("KEY_V",), ("KEY_P",))),
+    ))
+    return buttons
+
+
+# Krita 5 (krita/data/shortcuts/krita_default.shortcuts): Ctrl+0 zoom 100 %,
+# Tab canvas only, Ctrl+= / Ctrl+- zoom, Ctrl+] / Ctrl+[ rotate the canvas,
+# M / Alt+M mirror. Krita has no default for fit and none for a reset rotation.
+def krita_spacemouse_buttons() -> dict[str, SpaceMouseButton]:
+    buttons = {
+        "8": _press("Rotate right", CTRL, "KEY_RIGHTBRACE"),
+        "9": _press("Rotate left", CTRL, "KEY_LEFTBRACE"),
+    }
+    buttons.update(_function_keys(
+        (_press("Zoom 100%", CTRL, "KEY_0"), _press("Canvas only", "KEY_TAB")),
+        (_press("Zoom in", CTRL, "KEY_EQUAL"), _press("Zoom out", CTRL, "KEY_MINUS")),
+        (_press("Rotate right", CTRL, "KEY_RIGHTBRACE"), _press("Rotate left", CTRL, "KEY_LEFTBRACE")),
+        (_press("Mirror view", "KEY_M"), _press("Mirror cursor", ALT, "KEY_M")),
+        (_press("Undo", CTRL, "KEY_Z"), _press("Redo", CTRL, SHIFT, "KEY_Z")),
+    ))
+    return buttons
+
+
+# GIMP 3 (app/actions/view-actions.c, edit-actions.c): Ctrl+Shift+J fits the
+# image, + / - on the keypad zoom, 1 is 1:1, ` reverts the zoom, Shift+1 (!)
+# resets flip and rotate, F11 full screen, Ctrl+Z / Ctrl+Y, X / D colours.
+def gimp_spacemouse_buttons() -> dict[str, SpaceMouseButton]:
+    buttons = {"1": _press("Fit image", CTRL, SHIFT, "KEY_J")}
+    buttons.update(_function_keys(
+        (_press("Zoom in", "KEY_KPPLUS"), _press("Zoom out", "KEY_KPMINUS")),
+        (_press("Zoom 1:1", "KEY_1"), _press("Revert zoom", "KEY_GRAVE")),
+        (_press("Reset view", SHIFT, "KEY_1"), _press("Full screen", "KEY_F11")),
+        (_press("Undo", CTRL, "KEY_Z"), _press("Redo", CTRL, "KEY_Y")),
+        (_press("Swap colours", "KEY_X"), _press("Default colours", "KEY_D")),
+    ))
+    return buttons
+
+
+# Inkscape 1.x (share/keys/inkscape.xml): 5 zoom page, 4 drawing, 3 selection,
+# = / - zoom, ` / ~ previous / next zoom, S selector, N node tool, H / V flip.
+def inkscape_spacemouse_buttons() -> dict[str, SpaceMouseButton]:
+    buttons = {"1": _press("Zoom page", "KEY_5")}
+    buttons.update(_function_keys(
+        (_press("Zoom drawing", "KEY_4"), _press("Zoom selection", "KEY_3")),
+        (_press("Zoom in", "KEY_EQUAL"), _press("Zoom out", "KEY_MINUS")),
+        (_press("Previous zoom", "KEY_GRAVE"), _press("Next zoom", SHIFT, "KEY_GRAVE")),
+        (_press("Selector", "KEY_S"), _press("Node tool", "KEY_N")),
+        (_press("Flip horizontal", "KEY_H"), _press("Flip vertical", "KEY_V")),
+    ))
+    return buttons
+
+
+# darktable 5 (src/libs/navigation.c, copy_history.c, thumbtable.c, ratings.c,
+# views/darkroom.c, gui/gtk.c): Alt+3 fits the image, Tab hides the panels,
+# Ctrl+B colour assessment (darkroom), R rejects, 0 clears the rating,
+# Ctrl+C / Ctrl+V copy and paste the history stack, Ctrl+D duplicates,
+# Shift+O raw overexposure (darkroom), Ctrl+Z / Ctrl+Y.
+def darktable_spacemouse_buttons() -> dict[str, SpaceMouseButton]:
+    buttons = {"1": _press("Fit image", ALT, "KEY_3")}
+    buttons.update(_function_keys(
+        (_press("Panels", "KEY_TAB"), _press("Colour check", CTRL, "KEY_B")),
+        (_press("Reject", "KEY_R"), _press("Clear rating", "KEY_0")),
+        (_press("Copy edits", CTRL, "KEY_C"), _press("Paste edits", CTRL, "KEY_V")),
+        (_press("Duplicate", CTRL, "KEY_D"), _press("Overexposed", SHIFT, "KEY_O")),
+        (_press("Undo", CTRL, "KEY_Z"), _press("Redo", CTRL, "KEY_Y")),
+    ))
+    return buttons
+
+
+# Kdenlive 25 (src/mainwindow_actions.cpp, monitor/monitormanager.cpp): Space
+# plays, K pauses, S / X the select and razor tools, V / B insert / overwrite
+# the zone, Z lifts, Shift+X extracts, I / O set in and out.
+def kdenlive_spacemouse_buttons() -> dict[str, SpaceMouseButton]:
+    return _function_keys(
+        (_press("Play / pause", "KEY_SPACE"), _press("Pause", "KEY_K")),
+        (_press("Select tool", "KEY_S"), _press("Razor tool", "KEY_X")),
+        (_press("Insert zone", "KEY_V"), _press("Overwrite zone", "KEY_B")),
+        (_press("Lift", "KEY_Z"), _press("Extract", SHIFT, "KEY_X")),
+        (_press("Set in", "KEY_I"), _press("Set out", "KEY_O")),
+    )
+
+
+# DaVinci Resolve 19/20, Edit page. Third-party shortcut references only (the
+# application is closed source): Space plays, K stops, A / B the selection and
+# blade tools, F9 / F10 insert / overwrite, I / O mark, Ctrl+Z, Ctrl+Shift+Z,
+# Shift+Z fits the timeline. On Wayland Resolve may ignore virtual keys.
+def resolve_spacemouse_buttons() -> dict[str, SpaceMouseButton]:
+    buttons = {"1": _press("Fit timeline", SHIFT, "KEY_Z")}
+    buttons.update(_function_keys(
+        (_press("Play / pause", "KEY_SPACE"), _press("Stop", "KEY_K")),
+        (_press("Select tool", "KEY_A"), _press("Blade tool", "KEY_B")),
+        (_press("Insert", "KEY_F9"), _press("Overwrite", "KEY_F10")),
+        (_press("Mark in", "KEY_I"), _press("Mark out", "KEY_O")),
+        (_press("Undo", CTRL, "KEY_Z"), _press("Redo", CTRL, SHIFT, "KEY_Z")),
+    ))
+    return buttons
+
+
+# KiCad 9 has no 3D mouse support and no view keys that fit every editor (the
+# 3D viewer's Z / X / Y would start routing in the PCB editor), so only Fit and
+# the function keys: Home fits, F1 / F2 zoom, M moves, G drags, R rotates,
+# E opens the properties, Ctrl+Z / Ctrl+Y, Ctrl+Home zooms to the objects,
+# N is the next grid.
+def kicad_spacemouse_buttons() -> dict[str, SpaceMouseButton]:
+    buttons = {"1": _press("Fit to screen", "KEY_HOME")}
+    buttons.update(_function_keys(
+        (_press("Zoom in", "KEY_F1"), _press("Zoom out", "KEY_F2")),
+        (_press("Move", "KEY_M"), _press("Drag", "KEY_G")),
+        (_press("Rotate", "KEY_R"), _press("Properties", "KEY_E")),
+        (_press("Undo", CTRL, "KEY_Z"), _press("Redo", CTRL, "KEY_Y")),
+        (_press("Zoom to objects", CTRL, "KEY_HOME"), _press("Next grid", "KEY_N")),
+    ))
+    return buttons
+
+
+
 @dataclass(frozen=True)
 class AppPack:
     name: str
@@ -1071,9 +1395,17 @@ class AppPack:
     advanced: Callable[[], list[Segment]] | None = None
     # The dial's look for the whole advanced profile (Profile.overlay).
     advanced_look: tuple[tuple[str, object], ...] = ()
+    # SpaceMouse buttons of the pack (Profile.spacemouse_buttons), built fresh
+    # on each call; the advanced variant has its own only when it needs one.
+    spacemouse: Callable[[], dict[str, SpaceMouseButton]] | None = None
+    spacemouse_advanced: Callable[[], dict[str, SpaceMouseButton]] | None = None
 
     def segments(self, advanced: bool = False) -> list[Segment]:
         return (self.advanced if advanced and self.advanced else self.factory)()
+
+    def spacemouse_buttons(self, advanced: bool = False) -> dict[str, SpaceMouseButton]:
+        build = self.spacemouse_advanced if advanced and self.spacemouse_advanced else self.spacemouse
+        return build() if build else {}
 
 
 # The menu of a timeline editor shows at the top, away from the timeline.
@@ -1082,20 +1414,29 @@ TIMELINE_MENU = (("position", "top"),)
 # Creator applications first: the ProArt spirit of the laptop.
 APP_PACKS: tuple[AppPack, ...] = (
     AppPack("GIMP", ("gimp",), gimp_profile_segments, "org.gimp.GIMP.desktop", "Photo & graphics",
-            advanced=gimp_advanced_segments),
+            advanced=gimp_advanced_segments, spacemouse=gimp_spacemouse_buttons),
     AppPack("Krita", ("krita",), krita_profile_segments, "org.kde.krita.desktop", "Photo & graphics",
-            advanced=krita_advanced_segments),
+            advanced=krita_advanced_segments, spacemouse=krita_spacemouse_buttons),
     AppPack("Inkscape", ("inkscape",), inkscape_profile_segments, "org.inkscape.Inkscape.desktop", "Photo & graphics",
-            advanced=inkscape_advanced_segments),
+            advanced=inkscape_advanced_segments, spacemouse=inkscape_spacemouse_buttons),
     AppPack("darktable", ("darktable",), darktable_profile_segments, "org.darktable.darktable.desktop", "Photo & graphics",
-            advanced=darktable_advanced_segments),
+            advanced=darktable_advanced_segments, spacemouse=darktable_spacemouse_buttons),
     AppPack("Blender", ("blender",), blender_profile_segments, "org.blender.Blender.desktop", "3D",
-            advanced=blender_advanced_segments),
+            advanced=blender_advanced_segments, spacemouse=blender_spacemouse_buttons),
+    AppPack("FreeCAD", ("freecad",), freecad_profile_segments, "org.freecad.FreeCAD.desktop", "3D",
+            "Keys reach the 3D view or the sketch only while it has the focus",
+            advanced=freecad_advanced_segments, spacemouse=freecad_spacemouse_buttons),
+    AppPack("KiCad", ("kicad", "pcbnew", "eeschema"), kicad_profile_segments, "org.kicad.pcbnew.desktop",
+            "Electronics", "For the PCB editor; the schematic editor shares zoom, grid, move and rotate "
+            "(add a profile for it too)",
+            advanced=kicad_advanced_segments, spacemouse=kicad_spacemouse_buttons),
     AppPack("Kdenlive", ("kdenlive",), kdenlive_profile_segments, "org.kde.kdenlive.desktop", "Video",
-            advanced=kdenlive_advanced_segments, advanced_look=TIMELINE_MENU),
+            advanced=kdenlive_advanced_segments, advanced_look=TIMELINE_MENU,
+            spacemouse=kdenlive_spacemouse_buttons),
     AppPack("DaVinci Resolve", ("resolve", "davinci"), resolve_profile_segments,
             "com.blackmagicdesign.resolve.desktop", "Video",
-            advanced=resolve_advanced_segments, advanced_look=TIMELINE_MENU),
+            advanced=resolve_advanced_segments, advanced_look=TIMELINE_MENU,
+            spacemouse=resolve_spacemouse_buttons),
     AppPack("Shotcut", ("shotcut",), shotcut_profile_segments, "org.shotcut.Shotcut.desktop", "Video",
             advanced=shotcut_advanced_segments, advanced_look=TIMELINE_MENU),
     AppPack("Audacity", ("audacity",), audacity_profile_segments, "org.audacityteam.Audacity.desktop", "Audio",
@@ -1156,7 +1497,8 @@ def profile_for_pack(pack: AppPack, advanced: bool = False) -> Profile:
 def _pack_profile(pack: AppPack, name: str, app_id: str, advanced: bool) -> Profile:
     advanced = advanced and pack.advanced is not None
     return Profile(name=name, app_id=app_id, segments=pack.segments(advanced),
-                   overlay=dict(pack.advanced_look) if advanced else {})
+                   overlay=dict(pack.advanced_look) if advanced else {},
+                   spacemouse_buttons=pack.spacemouse_buttons(advanced))
 
 
 def variant_summary(pack: AppPack, advanced: bool = False) -> str:

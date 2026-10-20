@@ -2,7 +2,8 @@
 """Regenerate the README pictures in preview/, keeping files that did not change.
 
 Renders every picture into a temporary directory (the on-screen dial with
-tools/render_overlay_preview.js, the settings app with
+tools/render_overlay_preview.js, the SpacePilot Pro screen with
+tools/render_screen_preview.py, the settings app with
 tools/screenshot_settings.py) and compares each with the committed one. The
 settings app runs inside a headless mutter on its own D-Bus session, so no
 window shows up, nothing steals focus and the pictures never catch an
@@ -65,6 +66,9 @@ def headless(command: list[str]) -> list[str]:
 
 def render(output: Path, visible: bool = False) -> None:
     subprocess.run(["gjs", "-m", str(ROOT / "tools" / "render_overlay_preview.js"), str(output)],
+                   check=True, stdout=subprocess.DEVNULL, timeout=TIMEOUT)
+    # The SpacePilot Pro screen, painted with Cairo from a demo configuration.
+    subprocess.run([sys.executable, str(ROOT / "tools" / "render_screen_preview.py"), str(output)],
                    check=True, stdout=subprocess.DEVNULL, timeout=TIMEOUT)
     screenshots = [sys.executable, str(ROOT / "tools" / "screenshot_settings.py"), str(output)]
     # The private D-Bus session has no accessibility bus. GSettings defaults

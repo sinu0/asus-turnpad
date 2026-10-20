@@ -57,6 +57,18 @@ class LegacyAdapterTest(unittest.TestCase):
         self.assertNotIn("firefox.desktop", shortcuts)
         self.assertIn("Volume", shortcuts["none"])
 
+    def test_profile_with_only_screen_overrides_stays_active(self):
+        config = DialPadConfig(profiles=[
+            Profile(name="Default", segments=[volume_segment()]),
+            Profile(name="Blender", app_id="blender.desktop", screen={"pages": ["keys", "clock"]}),
+            Profile(name="Empty", app_id="empty.desktop"),
+        ])
+        shortcuts = shortcuts_from_config(config)
+        self.assertEqual(shortcuts["blender.desktop"]["_meta"]["name"], "Blender")
+        self.assertIn("Volume", shortcuts["blender.desktop"])  # the dial keeps the default menu
+        self.assertEqual(shortcuts["none"]["_meta"]["name"], "Default")
+        self.assertNotIn("empty.desktop", shortcuts)
+
     def test_default_config(self):
         shortcuts = shortcuts_from_config(_default_config())
         self.assertIn("none", shortcuts)

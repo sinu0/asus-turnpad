@@ -2,7 +2,7 @@
 set -e
 
 if [ "$1" = remove ]; then
-    echo "==> Users of Turnpad: run 'systemctl --user disable --now asus-turnpad asus-turnpad-overlay' (settings in ~/.config/asus-turnpad stay)."
+    echo "==> Users of Turnpad: run 'systemctl --user disable --now asus-turnpad asus-turnpad-overlay' and, with a SpaceMouse screen, 'systemctl --user stop asus-turnpad-screen' (settings in ~/.config/asus-turnpad stay)."
 fi
 
 #DEBHELPER#
