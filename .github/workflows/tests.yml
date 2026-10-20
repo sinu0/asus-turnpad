@@ -19,7 +19,7 @@ jobs:
         run: |
           mkdir -m 700 -p "$XDG_RUNTIME_DIR"
           pacman -Syu --noconfirm --needed \
-            git python python-gobject python-cairo python-dbus python-pillow \
+            git python python-gobject python-cairo python-dbus python-pillow python-libevdev \
             gtk4 libadwaita gjs mutter dbus \
             adwaita-icon-theme adwaita-fonts noto-fonts
 
