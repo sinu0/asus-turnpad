@@ -51,6 +51,9 @@ from config.schema import (
     MODIFIER_KEYS,
     OVERLAY_POSITIONS,
     POINTER_GAP_MAX,
+    SCREEN_PAGES,
+    SPACEMOUSE_LABEL_MAX,
+    ConfigError,
     DialPadConfig,
     MacroStep,
     ModifierActions,
@@ -61,12 +64,17 @@ from config.schema import (
     StepType,
     _encoder,
     darktable_colour_labels_segment,
+    describe_changes,
     load_config,
+    merge_portable,
     normalize_key_name,
+    portable_config,
     save_config,
+    settings_document,
+    settings_from_text,
     shell_commands,
 )
-from config.identity import APP_ID, APP_NAME, DBUS_INTERFACE, DBUS_NAME, DBUS_PATH, DRIVER_SERVICE
+from config.identity import APP_ID, APP_NAME, DBUS_INTERFACE, DBUS_NAME, DBUS_PATH, DRIVER_SERVICE, SCREEN_SERVICE
 from config.migrate import layout_geometry, migrate_old_format
 from config.skins import (
     DIAL_SHAPES,
@@ -90,8 +98,18 @@ from config.skins import (
     user_skins,
     without_private_keys,
 )
+from config_app import contexts as cx
+from config_app import hardware as hw
+from config_app import screen_page as sp
 from config_app import spacemouse as sm
+from config_app import spacemouse_extra as sx
+from config_app.commandline import parse as parse_command_line
+from config_app.commandline import resolve_app
+from config_app.context_dialogs import contexts_group
+from config_app.device_dialogs import MousePicker, SetupAssistant
 from config_app.outline_editor import PRESETS, OutlineEditor
+from config_app.recorder_dialog import MacroRecorderDialog
+from config_app.spacemouse_ui import SpaceMouseExtras
 from desktop.color_scheme import ColorScheme
 from overlay.gtk_icons import draw_icon
 from overlay.painter import (
@@ -105,6 +123,7 @@ from overlay.painter import (
     paint_submenu,
     submenu_size,
 )
+from spacemouse_devices import SPACEPILOT_PRO, screens_present
 
 
 STYLE_FILE = Path(__file__).with_name("style.css")
@@ -268,7 +287,11 @@ def _page_sidebar(stack):
         box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
         box.append(Gtk.Image.new_from_icon_name(page.get_icon_name()))
         box.append(Gtk.Label(label=page.get_title(), xalign=0, hexpand=True))
-        sidebar.append(Gtk.ListBoxRow(child=box))
+        row = Gtk.ListBoxRow(child=box)
+        # A page can be hidden (Screen without a screen): its row goes too.
+        row.set_visible(page.get_visible())
+        page.connect("notify::visible", lambda page, _param, row=row: row.set_visible(page.get_visible()))
+        sidebar.append(row)
 
     def show_page(_sidebar, row):
         if row is not None and stack.get_visible_child_name() != names[row.get_index()]:
@@ -295,6 +318,22 @@ def _spin_row(title, subtitle, value, minimum, maximum, step, digits, changed):
     row.set_digits(digits)
     row.set_value(value)
     row.connect("notify::value", lambda row, _param: changed(row.get_value()))
+    return row
+
+
+def _scale_row(title, subtitle, value, changed):
+    """A row with a 0-100 slider."""
+    row = Adw.ActionRow(title=title)
+    if subtitle:
+        row.set_subtitle(subtitle)
+    scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 100, 1)
+    scale.set_value(value)
+    scale.set_draw_value(True)
+    scale.set_value_pos(Gtk.PositionType.RIGHT)
+    scale.set_size_request(180, -1)
+    scale.set_valign(Gtk.Align.CENTER)
+    scale.connect("value-changed", lambda scale: changed(int(round(scale.get_value()))))
+    row.add_suffix(scale)
     return row
 
 
@@ -331,9 +370,51 @@ def _colour_swatch(colour, size=14):
     return area
 
 
-class Application(Adw.Application):
+class _ScreenPicture(Gtk.Widget):
+    """The preview of the screen: 4:3, as wide as it gets up to 640 px and then as
+    high as that needs. A scrolled page gives a widget its minimum height, so the
+    height must follow the width in the minimum too (a Gtk.Picture alone has none)."""
+
+    WIDTH, HEIGHT = 640, 480
+
+    def __init__(self, picture):
+        super().__init__()
+        self._picture = picture
+        picture.set_parent(self)
+
+    def do_measure(self, orientation, for_size):
+        if orientation == Gtk.Orientation.HORIZONTAL:
+            return 0, self.WIDTH, -1, -1
+        height = self.HEIGHT if for_size < 0 else round(min(for_size, self.WIDTH) * self.HEIGHT / self.WIDTH)
+        return height, height, -1, -1
+
+    def do_size_allocate(self, width, height, baseline):
+        self._picture.allocate(width, height, baseline, None)
+
+    def do_dispose(self):
+        if self._picture is not None:
+            self._picture.unparent()
+            self._picture = None
+        Gtk.Widget.do_dispose(self)
+
+
+class Application(SpaceMouseExtras, Adw.Application):
+    # (name, title, icon, builder) of the pages in the sidebar's order.
+    PAGES = (
+        ("actions", "Dial Controls", "input-dialpad-symbolic", "_build_actions_page"),
+        ("profiles", "Apps & Profiles", "applications-graphics-symbolic", "_build_profiles_page"),
+        ("look", "Skins", "preferences-desktop-appearance-symbolic", "_build_look_page"),
+        ("device", "Behaviour", "preferences-system-symbolic", "_build_behaviour_page"),
+        ("calibration", "Calibration", "find-location-symbolic", "_build_calibration_page"),
+        ("spacemouse", "SpaceMouse", "input-gaming-symbolic", "_build_spacemouse_page"),
+        ("screen", "Screen", "video-display-symbolic", "_build_screen_page"),
+        ("diagnostics", "Driver", "utilities-terminal-symbolic", "_build_diagnostics_page"),
+    )
+
     def __init__(self):
-        super().__init__(application_id=APP_ID)
+        # HANDLES_COMMAND_LINE: a second launch (--add-profile from the driver's
+        # notification) is forwarded to the window that is open.
+        super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.HANDLES_COMMAND_LINE)
         self.config: DialPadConfig | None = None
         self._save_source = 0
         self._window = None
@@ -376,9 +457,45 @@ class Application(Adw.Application):
         self._sm_rows = {}
         self._sm_identify_row = None
         self._sm_probe = None
-        self._sm_extra_buttons = 0
+        self._sm_extra_buttons = set()
+        self._sm_keys_box = None
+        self._sm_device = ""
         self._sm_status_row = None
         self._sm_restart_source = 0
+        self._init_spacemouse_extras()
+        # Screen page: the profile edited (None = all applications), the
+        # SpaceMouse screens found, the preview and the containers that are
+        # filled again when something they show changes.
+        self._screen_scope: Profile | None = None
+        self._screen_scope_row = None
+        self._screen_scope_handler = 0
+        self._screen_present = []
+        self._screen_page = None
+        self._screen_status_rows = {}
+        self._screen_look_box = None
+        self._screen_pages_box = None
+        self._screen_app_box = None
+        self._screen_page_buttons = {}
+        self._screen_preview = None
+        self._screen_preview_frame = None
+        self._screen_preview_note = None
+        self._screen_preview_title = None
+        self._screen_preview_page = "keys"
+        self._screen_preview_source = 0
+        self._screen_monitor = None
+        self._screen_reload_source = 0
+        # Fields of config.screen changed here and not saved yet (see screen_page.ScreenSync).
+        self._screen_sync = sp.ScreenSync()
+        # The pages (a stable Adw.Bin per page, so a page can be built again
+        # after the configuration was replaced) and which of them fit the hardware.
+        self._page_bins = {}
+        self._view_pages = {}
+        self._found = hw.Detected()
+        self._driver_status = None
+        self._app_settings = dict(hw.APP_SETTINGS_DEFAULTS)
+        self._mouse_picker = None
+        self._openers_group = None
+        self._setup_assistant = None
 
     # --- lifecycle --------------------------------------------------------
 
@@ -416,18 +533,17 @@ class Application(Adw.Application):
         toolbar.add_top_bar(header)
 
         self._view_stack = Adw.ViewStack()
-        pages = (
-            (self._build_actions_page(), "actions", "Dial Controls", "input-dialpad-symbolic"),
-            (self._build_profiles_page(), "profiles", "Apps & Profiles", "applications-graphics-symbolic"),
-            (self._build_look_page(), "look", "Skins", "preferences-desktop-appearance-symbolic"),
-            (self._build_behaviour_page(), "device", "Behaviour", "preferences-system-symbolic"),
-            (self._build_calibration_page(), "calibration", "Calibration", "find-location-symbolic"),
-            (self._build_spacemouse_page(), "spacemouse", "SpaceMouse", "input-gaming-symbolic"),
-            (self._build_diagnostics_page(), "diagnostics", "Driver", "utilities-terminal-symbolic"),
-        )
-        for child, name, page_title, icon_name in pages:
-            page = self._view_stack.add_titled(child, name, page_title)
+        self._app_settings = hw.load_app_settings()
+        self._found = hw.detect()
+        for name, page_title, icon_name, builder in self.PAGES:
+            bin_ = Adw.Bin()
+            bin_.set_child(getattr(self, builder)())
+            page = self._view_stack.add_titled(bin_, name, page_title)
             page.set_icon_name(icon_name)
+            self._page_bins[name] = bin_
+            self._view_pages[name] = page
+        self._screen_page = self._view_pages["screen"]
+        self._update_page_visibility()
         self._view_stack.connect("notify::visible-child", self._on_visible_page_changed)
 
         content = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
@@ -442,9 +558,25 @@ class Application(Adw.Application):
         self._toasts = Adw.ToastOverlay()
         self._toasts.set_child(toolbar)
         self._window.set_content(self._toasts)
+        self._window.connect("notify::is-active", self._on_window_active)
         self._refresh_all()
+        self._watch_config_file()
         self._window.present()
         self._refresh_diagnostics()
+        if not self.config.setup_done:
+            # First run: after the window is up.
+            GLib.idle_add(lambda: self._show_setup_assistant() or GLib.SOURCE_REMOVE)
+
+    def do_command_line(self, command_line):
+        """--add-profile APP_ID: open Apps & Profiles and add a profile for that application."""
+        add_profile, error = parse_command_line(command_line.get_arguments()[1:])
+        if error:
+            command_line.printerr(f"{error}\nUsage: main.py [--add-profile APP_ID]\n")
+            return 2
+        self.activate()
+        if add_profile and self.config is not None:
+            self._add_profile_for_app_id(add_profile)
+        return 0
 
     def _detect_layout(self):
         """Return the layout the installed driver runs with (geometry differs per model)."""
@@ -473,6 +605,13 @@ class Application(Adw.Application):
 
     def do_shutdown(self):
         self._stop_spacemouse_probe()
+        for source in (self._screen_preview_source, self._screen_reload_source):
+            if source:
+                GLib.source_remove(source)
+        self._screen_preview_source = self._screen_reload_source = 0
+        if self._screen_monitor is not None:
+            self._screen_monitor.cancel()
+            self._screen_monitor = None
         # A measurement nobody kept is not accepted: the driver goes back too.
         if self._calibration_backup is not None and self.config is not None:
             geometry, self.config.device_name = self._calibration_backup
@@ -507,7 +646,10 @@ class Application(Adw.Application):
     def _save_config(self):
         self._save_source = 0
         if self.config is not None:
+            # The screen service may have saved its settings since this window read them.
+            self._adopt_screen_from_disk()
             save_config(self.config)
+            self._screen_sync.clear()
             self._call_driver("ReloadConfig", callback=self._on_reload_reply)
         return GLib.SOURCE_REMOVE
 
@@ -642,6 +784,7 @@ class Application(Adw.Application):
         self._refresh_profiles_page()
         self._rebuild_actions_page()
         self._refresh_spacemouse_page()
+        self._refresh_screen_page()
 
     def _on_visible_page_changed(self, stack, _param):
         name = stack.get_visible_child_name()
@@ -651,6 +794,12 @@ class Application(Adw.Application):
             self._rebuild_actions_page()
         elif name in ("diagnostics", "spacemouse"):
             self._refresh_diagnostics()
+        elif name == "screen":
+            self._adopt_screen_from_disk()
+            self._refresh_screen_presence()
+            self._refresh_screen_status()
+            self._fill_screen_app()
+            self._queue_screen_preview()
 
     def _scrolled_content(self, content, width=760):
         clamp = Adw.Clamp()
@@ -730,6 +879,8 @@ class Application(Adw.Application):
     def _profile_row(self, profile):
         row = Adw.ActionRow(title=GLib.markup_escape_text(profile.name))
         subtitle = self._profile_summary(profile)
+        if profile.contexts:
+            subtitle = f"{subtitle} · {len(profile.contexts)} context{'s' if len(profile.contexts) != 1 else ''}"
         if profile.app_id:
             subtitle = f"{subtitle}\n{profile.app_id}"
         row.set_subtitle(GLib.markup_escape_text(subtitle))
@@ -810,7 +961,7 @@ class Application(Adw.Application):
         dialog.present(self._window)
         entry.grab_focus()
 
-    def _show_app_picker(self):
+    def _show_app_picker(self, query=""):
         dialog = Adw.Dialog(title="Add application", content_width=520, content_height=620)
         view = Adw.ToolbarView()
         view.add_top_bar(Adw.HeaderBar())
@@ -820,6 +971,7 @@ class Application(Adw.Application):
         box.set_margin_bottom(12)
         search = Gtk.SearchEntry()
         search.set_placeholder_text("Search applications")
+        search.set_text(query)
         box.append(search)
         note = Gtk.Label(
             label="Applications marked “Pre-programmed” start with ready functions.",
@@ -877,6 +1029,20 @@ class Application(Adw.Application):
         rebuild()
         dialog.present(self._window)
         search.grab_focus()
+
+    def _add_profile_for_app_id(self, app_id):
+        """Add a profile for the application ``app_id`` (what the driver saw: a
+        desktop id or a program name), asking basic or advanced when a pack exists."""
+        if self._view_stack is not None:
+            self._view_stack.set_visible_child_name("profiles")
+        apps = [(app.get_id(), app.get_display_name()) for app in Gio.AppInfo.get_all() if app.get_id()]
+        pack = pack_for_app(app_id)
+        desktop_id, name, known = resolve_app(app_id, apps, pack.name if pack else None)
+        if not known and pack is None:
+            # Nothing to start from: the normal list, searched for the application.
+            self._show_app_picker(app_id)
+            return
+        self._add_application(name, desktop_id)
 
     def _add_application(self, name, app_id):
         for profile in self.config.profiles:
@@ -965,13 +1131,21 @@ class Application(Adw.Application):
 
         dialog.open(self._window, None, finish)
 
-    def _confirm_profiles(self, profiles, apply, heading=None, body="", responses=None):
+    def _confirm_profiles(
+        self, profiles, apply, heading=None, body="", responses=None, spacemouse_buttons=None, known_commands=(),
+        spacemouse_layers=None,
+    ):
         """Ask before using imported profiles; always when they run commands.
 
         responses maps response ids to labels and apply takes the chosen id;
         without them there is one "Import" choice and apply takes nothing.
+        spacemouse_buttons are imported global SpaceMouse buttons whose commands
+        count too; commands in known_commands (already set up here) do not.
         """
-        commands = shell_commands(profiles)
+        commands = [
+            command for command in shell_commands(profiles, spacemouse_buttons, spacemouse_layers)
+            if command not in known_commands
+        ]
         if not commands and responses is None:
             apply()
             return
@@ -1184,6 +1358,7 @@ class Application(Adw.Application):
         )
         self._actions_box.append(self._profile_settings_group(profile))
         self._actions_box.append(self._functions_group(profile))
+        self._actions_box.append(contexts_group(self, profile))
         self._actions_box.append(self._profile_ai_group(profile))
         if self._dial_preview is not None:
             self._dial_preview.queue_draw()
@@ -1599,7 +1774,8 @@ class Application(Adw.Application):
                     row.add_prefix(Gtk.Image.new_from_icon_name("starred-symbolic"))
                     row.set_activatable(True)
                     row.connect("activated", lambda _row, advanced=advanced: (
-                        dialog.close(), self._apply_pack(profile, pack, advanced)))
+                        dialog.close(), self._apply_pack(profile, pack, advanced),
+                        on_added() if on_added is not None else None))
                     section.add(row)
                 page.add(section)
                 groups.append(section)
@@ -1922,7 +2098,14 @@ class Application(Adw.Application):
                         holder, field, None, lambda: changed(True), title
                     ),
                 )
-                group.set_header_suffix(add)
+                record = _icon_button(
+                    "media-record-symbolic", "Record the keys you press as actions",
+                    lambda holder=holder, field=field: self._record_macro(holder, field, lambda: changed(True)),
+                )
+                tools = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=2)
+                tools.append(record)
+                tools.append(add)
+                group.set_header_suffix(tools)
                 steps = getattr(holder, field)
                 if not steps:
                     empty = Adw.ActionRow(
@@ -1946,6 +2129,19 @@ class Application(Adw.Application):
 
         dialog.connect("closed", closed)
         dialog.present(self._window)
+
+    def _record_macro(self, holder, field, changed):
+        """Record keys from the keyboard into holder's macro field (append or replace)."""
+        steps = getattr(holder, field)
+
+        def done(recorded, replace):
+            if replace:
+                steps[:] = recorded
+            else:
+                steps.extend(recorded)
+            changed()
+
+        MacroRecorderDialog(self._window, len(steps), done).present()
 
     def _step_row(self, segment, field, index, step, changed, title=None):
         steps = getattr(segment, field)
@@ -3749,8 +3945,8 @@ class Application(Adw.Application):
         self._sm_group = Adw.PreferencesGroup(
             title="Buttons",
             description=(
-                "What each button of the SpaceMouse does. A button you leave alone passes through to "
-                "other applications. Click a button to change it."
+                "What each key of the SpaceMouse does. A key you leave alone passes through to "
+                "other applications. Click a key to change it."
             ),
         )
         self._sm_scope_row = Adw.ComboRow(
@@ -3759,11 +3955,18 @@ class Application(Adw.Application):
         )
         self._sm_scope_handler = self._sm_scope_row.connect("notify::selected", self._on_spacemouse_scope)
         self._sm_group.add(self._sm_scope_row)
+        self._sm_group.add(self._spacemouse_layer_row())
         self._sm_identify_row = _button_row("Press a SpaceMouse button…", "input-gaming-symbolic")
         self._sm_identify_row.connect("activated", lambda _row: self._toggle_spacemouse_identify())
         self._sm_group.add(self._sm_identify_row)
         content.append(self._sm_group)
+        self._sm_keys_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18)
+        content.append(self._sm_keys_box)
+        content.append(self._spacemouse_motion_group())
+        content.append(self._spacemouse_blender_group())
         content.append(self._spacemouse_cap_group())
+        self._refresh_layer_row()
+        self._start_spacemouse_poll()
         return self._scrolled_content(content)
 
     def _spacemouse_group(self):
@@ -3783,6 +3986,7 @@ class Application(Adw.Application):
                 row.set_sensitive(active)
             if settings.enabled != active:
                 settings.enabled = active
+                self._update_openers_hint()
                 # The driver opens spacenavd at start.
                 self._restart_driver()
 
@@ -3840,6 +4044,10 @@ class Application(Adw.Application):
         elif status.get("spacemouse"):
             device = status.get("spacemouse_device")
             row.set_subtitle(f"Connected · {device}" if device else "Connected")
+            if device and device != self._sm_device:
+                # The key list follows the model of the device.
+                self._sm_device = device
+                self._rebuild_spacemouse_rows()
         elif not sm.socket_exists(self.config.spacemouse.socket):
             row.set_subtitle(
                 "spacenavd is not running. Install the spacenavd package of your distribution "
@@ -3906,65 +4114,98 @@ class Application(Adw.Application):
         """Follow profiles that were added, renamed or removed."""
         if self._sm_group is None or self.config is None:
             return
-        if self._sm_scope is not None and self._sm_scope not in self.config.profiles:
+        if not cx.scope_alive(self.config, self._sm_scope):
             self._sm_scope = None
-        labels = ["All applications"] + [
-            profile.name if profile.app_id is None else f"{profile.name}  ·  app" for profile in self.config.profiles
-        ]
+        # All applications, then every profile followed by its contexts.
+        entries = cx.scope_entries(self.config)
+        labels = ["All applications"] + [label for label, _scope in entries]
+        scopes = [scope for _label, scope in entries]
         self._sm_scope_row.handler_block(self._sm_scope_handler)
         self._sm_scope_row.set_model(Gtk.StringList.new(labels))
-        self._sm_scope_row.set_selected(
-            0 if self._sm_scope is None else self.config.profiles.index(self._sm_scope) + 1
-        )
+        self._sm_scope_row.set_selected(0 if self._sm_scope is None else scopes.index(self._sm_scope) + 1)
         self._sm_scope_row.handler_unblock(self._sm_scope_handler)
+        self._refresh_layer_row()
+        self._fill_motion()
+        self._refresh_blender_group()
         self._rebuild_spacemouse_rows()
 
     def _on_spacemouse_scope(self, row, _param):
         index = row.get_selected()
-        profiles = self.config.profiles if self.config is not None else []
-        scope = profiles[index - 1] if 1 <= index <= len(profiles) else None
-        if scope is not self._sm_scope:
+        scopes = [scope for _label, scope in cx.scope_entries(self.config)] if self.config is not None else []
+        scope = scopes[index - 1] if 1 <= index <= len(scopes) else None
+        if scope != self._sm_scope:
             self._sm_scope = scope
+            self._refresh_layer_row()
+            self._fill_motion()
             self._rebuild_spacemouse_rows()
+
+    def spacemouse_page_available(self):
+        """Whether the SpaceMouse page is shown (it hides on a computer without a SpaceMouse)."""
+        page = self._view_pages.get("spacemouse")
+        return page is not None and page.get_visible()
+
+    def edit_context_buttons(self, scope):
+        """Open the SpaceMouse page with ``scope`` (a contexts.ContextScope) chosen."""
+        self._sm_scope = scope
+        self._refresh_spacemouse_page()
+        if self._view_stack is not None:
+            self._view_stack.set_visible_child_name("spacemouse")
 
     def _spacemouse_changed(self):
         """A button was edited: show it in the list and save."""
         self._rebuild_spacemouse_rows()
         self._schedule_save()
 
+    def _spacemouse_maps(self):
+        return sx.all_maps(self.config)
+
+    def _spacemouse_model(self, maps):
+        return sm.model_for_device(self._sm_device, sm.button_count(maps))
+
+    def _spacemouse_key_rows(self):
+        maps = self._spacemouse_maps()
+        model = self._spacemouse_model(maps)
+        return model, sm.key_rows(model, maps, self._sm_extra_buttons)
+
+    def _spacemouse_row_text(self, key_row):
+        """(subtitle, tooltip, dim) of a key's row under the chosen scope and layer."""
+        return sx.row_info(self.config, self._sm_scope, self._sm_layer, key_row, self._sm_titles())
+
     def _rebuild_spacemouse_rows(self):
-        group = self._sm_group
-        if group is None or self.config is None:
+        box = self._sm_keys_box
+        if box is None or self.config is None:
             return
-        for row in self._sm_rows.values():
-            group.remove(row)
+        child = box.get_first_child()
+        while child is not None:
+            following = child.get_next_sibling()
+            box.remove(child)
+            child = following
         self._sm_rows = {}
-        profile = self._sm_scope
-        maps = [sm.global_buttons(self.config)] + [item.spacemouse_buttons for item in self.config.profiles]
-        count = max(sm.button_count(maps), self._sm_extra_buttons)
-        for index in range(count):
-            button, source = sm.binding(self.config, profile, index)
-            text = sm.describe_button(button)
-            row = Adw.ActionRow(title=GLib.markup_escape_text(sm.button_name(index)))
+        model, key_rows = self._spacemouse_key_rows()
+        groups = {}
+        for key_row in key_rows:
+            if key_row.group not in groups:
+                groups[key_row.group] = Adw.PreferencesGroup(title=sm.group_title(model, key_row.group))
+                box.append(groups[key_row.group])
+            text, tooltip, dim = self._spacemouse_row_text(key_row)
+            row = Adw.ActionRow(title=GLib.markup_escape_text(key_row.title))
             row.set_title_lines(1)
             row.set_subtitle_lines(1)
-            number = Gtk.Label(label=str(index), width_chars=2)
-            number.add_css_class("dim-label")
-            number.add_css_class("caption")
-            row.add_prefix(number)
-            if profile is not None and source == "global":
-                text = f"{text} · from All applications"
+            printed = Gtk.Label(label=key_row.label, width_chars=6, max_width_chars=8)
+            printed.set_ellipsize(3)  # Pango.EllipsizeMode.END
+            printed.add_css_class("dim-label")
+            printed.add_css_class("caption")
+            row.add_prefix(printed)
             row.set_subtitle(GLib.markup_escape_text(text))
-            row.set_tooltip_text(text)
-            if (profile is not None and source != "profile") or source is None or (
-                button is not None and button.press is None and button.hold is None
-            ):
+            row.set_tooltip_text(tooltip)
+            if dim:
                 row.add_css_class("dim-label")
             row.add_suffix(Gtk.Image.new_from_icon_name("go-next-symbolic"))
             row.set_activatable(True)
-            row.connect("activated", lambda _row, number=index: self._show_spacemouse_button_dialog(number))
-            group.add(row)
-            self._sm_rows[index] = row
+            row.connect("activated", lambda _row, number=key_row.indexes[0]: self._show_spacemouse_button_dialog(number))
+            groups[key_row.group].add(row)
+            for index in key_row.indexes:
+                self._sm_rows[index] = row
 
     # Identify by pressing ----------------------------------------------------------
 
@@ -4003,24 +4244,34 @@ class Application(Adw.Application):
         if not 0 <= index < sm.SPACEMOUSE_BUTTONS:
             return
         if index not in self._sm_rows:
-            self._sm_extra_buttons = index + 1
+            self._sm_extra_buttons.add(index)
             self._rebuild_spacemouse_rows()
         row = self._sm_rows[index]
         row.grab_focus()
         row.add_css_class("proart-pressed")
         GLib.timeout_add(1800, lambda: row.remove_css_class("proart-pressed") or GLib.SOURCE_REMOVE)
-        self._toast(f"Button {index} · {sm.button_name(index)}")
+        self._toast(f"{sm.button_name(index, self._spacemouse_model(self._spacemouse_maps()))} · button {index}")
 
     # The editor of one button --------------------------------------------------------
 
     def _show_spacemouse_button_dialog(self, index):
-        """Press and hold actions of one button, for all applications or one profile."""
+        """Actions of one key, for all applications or one profile. A key the
+        device itself tells a short from a long press (function keys, T, R…)
+        has two raw buttons: a press action for each, no hold."""
         profile = self._sm_scope
+        layer = self._sm_layer
         config = self.config
-        key = str(index)
-        dialog = Adw.Dialog(
-            title=f"{sm.button_name(index)} · button {index}", content_width=560, content_height=700,
-        )
+        model, key_rows = self._spacemouse_key_rows()
+        key_row = sm.row_for_index(key_rows, index)
+        indexes = key_row.indexes if key_row is not None else (index,)
+        title = key_row.title if key_row is not None else f"Button {index}"
+        if key_row is not None and key_row.dual:
+            title = f"{title} · buttons {indexes[0]} and {indexes[1]}"
+        elif key_row is not None and key_row.key is not None:
+            title = f"{title} · button {index}"
+        if layer is not None:
+            title = f"{title} · layer “{layer}”"
+        dialog = Adw.Dialog(title=title, content_width=560, content_height=700)
         view = Adw.ToolbarView()
         view.add_top_bar(Adw.HeaderBar())
         page = Adw.PreferencesPage()
@@ -4030,65 +4281,109 @@ class Application(Adw.Application):
         profiles = [profile] if profile is not None else list(config.profiles)
         groups = sm.group_titles(profiles)
         functions = sm.function_titles(profiles)
-        current, source = sm.binding(config, profile, index)
-        working = {
-            "press": copy.deepcopy(current.press) if current else None,
-            "hold": copy.deepcopy(current.hold) if current else None,
-        }
+        # Per raw button: the actions being edited, what was last saved (an
+        # action that is not valid yet, hold keys without keys, is not saved,
+        # the previous one stays) and the label.
+        states = {}
+        for number in indexes:
+            current, _source = sx.current_binding(config, profile, layer, number)
+            working = {
+                "press": copy.deepcopy(current.press) if current else None,
+                "hold": copy.deepcopy(current.hold) if current else None,
+            }
+            states[number] = {
+                "working": working,
+                "stored": {slot: copy.deepcopy(working[slot]) for slot in working},
+                "label": current.label if current else "",
+            }
         sections = []
-        # What was last saved: an action that is not valid yet (hold keys
-        # without keys) is not saved, the previous one stays.
-        stored = {slot: copy.deepcopy(working[slot]) for slot in working}
 
-        def commit():
-            for slot in working:
-                if sm.is_valid(working[slot]):
-                    stored[slot] = copy.deepcopy(working[slot])
-            button = SpaceMouseButton(press=copy.deepcopy(stored["press"]), hold=copy.deepcopy(stored["hold"]))
-            if profile is None:
-                sm.store_global(sm.editable_global(config), index, button)
-            else:
-                sm.store(profile.spacemouse_buttons, index, button)
+        def commit(number):
+            state = states[number]
+            for slot in state["working"]:
+                if sm.is_valid(state["working"][slot]):
+                    state["stored"][slot] = copy.deepcopy(state["working"][slot])
+            button = SpaceMouseButton(
+                press=copy.deepcopy(state["stored"]["press"]), hold=copy.deepcopy(state["stored"]["hold"]),
+                label=state["label"],
+            )
+            sx.store_binding(config, profile, layer, number, button)
             self._spacemouse_changed()
 
-        if profile is not None:
+        if profile is not None or layer is not None:
             scope_group = Adw.PreferencesGroup()
 
             def override_toggled(active):
                 for section in sections:
                     section.set_sensitive(active)
-                if active:
-                    commit()
-                else:
-                    profile.spacemouse_buttons.pop(key, None)
-                    self._spacemouse_changed()
+                for number in indexes:
+                    if active:
+                        commit(number)
+                    else:
+                        sx.drop_binding(config, profile, layer, number)
+                self._spacemouse_changed()
 
-            scope_group.add(_switch_row(
-                f"Own binding for {profile.name}",
-                "Off: the button does what All applications says",
-                source == "profile", override_toggled,
-            ))
+            owned = any(sx.owns(config, profile, layer, number) for number in indexes)
+            if layer is not None:
+                where = f"the layer “{layer}”" + (f" for {profile.name}" if profile is not None else "")
+                below = "what All applications or the base map says" if profile is not None else "the base map says"
+                scope_group.add(_switch_row(
+                    f"Own binding in {where}", f"Off: the key does what {below}", owned, override_toggled,
+                ))
+            else:
+                scope_group.add(_switch_row(
+                    f"Own binding for {profile.name}",
+                    "Off: the key does what All applications says",
+                    owned, override_toggled,
+                ))
             page.add(scope_group)
 
-        for slot, title, description in (
-            ("press", "Press", "Runs when the button goes down; a modifier stays held until it is released."),
-            ("hold", "Hold", "Runs instead when the button stays down for the long-press time."),
-        ):
+        def add_section(number, slot, section_title, description, with_label):
             section = self._spacemouse_action_section(
-                working, slot, title, description, groups, functions, index, commit,
+                states[number]["working"], slot, section_title, description, groups, functions, number,
+                lambda number=number: commit(number),
             )
+            if with_label:
+                label_row = Adw.EntryRow(title="Label on the screen (empty: automatic)")
+                label_row.set_show_apply_button(True)
+                label_row.set_text(states[number]["label"])
+
+                def label_applied(row, number=number):
+                    states[number]["label"] = row.get_text().strip()[:SPACEMOUSE_LABEL_MAX]
+                    row.set_text(states[number]["label"])
+                    commit(number)
+
+                label_row.connect("apply", label_applied)
+                section.add(label_row)
             sections.append(section)
             page.add(section)
-        if profile is not None and source != "profile":
+
+        if key_row is not None and key_row.dual:
+            add_section(indexes[0], "press", "Short press", "Runs when the key is tapped.", True)
+            add_section(
+                indexes[1], "press", "Long press",
+                "The device decides: hold the key for about 1 s. Runs when it reports the long press.", True,
+            )
+        else:
+            number = indexes[0]
+            add_section(
+                number, "press", "Press",
+                "Runs when the button goes down; a modifier stays held until it is released.", True,
+            )
+            add_section(
+                number, "hold", "Hold", "Runs instead when the button stays down for the long-press time.", False,
+            )
+        if (profile is not None or layer is not None) and not owned:
             for section in sections:
                 section.set_sensitive(False)
 
-        if profile is None:
+        if profile is None and layer is None:
             reset_group = Adw.PreferencesGroup()
             reset = _button_row("Reset to default", "edit-undo-symbolic")
 
             def reset_button(_row):
-                sm.reset_global_button(config, index)
+                for number in indexes:
+                    sm.reset_global_button(config, number)
                 self._spacemouse_changed()
                 dialog.close()
 
@@ -4148,6 +4443,7 @@ class Application(Adw.Application):
         slot_row.set_subtitle("1 is the first entry of the dial's menu; a group opens its list")
         for row in (group_row, function_by_row, function_row, slot_row):
             group.add(row)
+        extras = self._sm_extra_action_rows(group, working, slot, commit, syncing)
         group_names = [""] + groups
         function_names = list(functions)
 
@@ -4179,13 +4475,15 @@ class Application(Adw.Application):
             function_row.set_selected(fnames.index(chosen) if chosen else 0)
             function_row._names = fnames
             slot_row.set_value((action.slot if action is not None and action.slot is not None else 0) + 1)
+            extras.sync()
             show_fields()
             syncing["active"] = False
 
         def show_fields():
             action = working[slot]
             kind = action.type if action is not None else "none"
-            keys_row.set_visible(kind in ("macro", "key_hold"))
+            keys_row.set_visible(kind in ("macro", "key_hold", "app"))
+            extras.show(kind)
             steps_row.set_visible(kind == "macro")
             group_row.set_visible(kind == "group")
             function_by_row.set_visible(kind == "function")
@@ -4197,15 +4495,18 @@ class Application(Adw.Application):
                 keys_row.set_title("Type the keys to hold, then Apply (not saved yet)")
                 keys_row.add_css_class("error")
             else:
-                keys_row.set_title("Keys held while the button is down, e.g. Ctrl+Shift" if kind == "key_hold"
-                                   else "Keys, e.g. Ctrl+Tab")
+                keys_row.set_title(
+                    "Keys held while the button is down, e.g. Ctrl+Shift" if kind == "key_hold"
+                    else "Keys to press when the application is not linked, e.g. E" if kind == "app"
+                    else "Keys, e.g. Ctrl+Tab"
+                )
                 keys_row.remove_css_class("error")
 
         def type_changed(row, _param):
             if syncing["active"]:
                 return
             choice = choice_keys[row.get_selected()]
-            action = sm.new_action(choice, working[slot])
+            action = sm.new_action(choice, working[slot], sx.action_layer_names(self.config, self._sm_scope))
             if action is not None and action.type == "function" and action.function is None and action.slot is None:
                 action.slot = 0
             if action is not None and action.type == "macro" and action.macro is None:
@@ -4263,8 +4564,614 @@ class Application(Adw.Application):
         function_by_row.connect("notify::selected", function_changed)
         function_row.connect("notify::selected", function_changed)
         slot_row.connect("notify::value", function_changed)
+        extras.resync = sync_rows
         sync_rows()
         return group
+
+    # --- Screen -----------------------------------------------------------------------
+
+    def _build_screen_page(self):
+        content = self._page_box()
+        content.append(self._screen_status_group())
+        content.append(self._screen_preview_group())
+        self._screen_look_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18)
+        content.append(self._screen_look_box)
+        self._screen_pages_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18)
+        content.append(self._screen_pages_box)
+        content.append(self._screen_app_group())
+        content.append(self._screen_keys_group())
+        self._fill_screen_look()
+        self._fill_screen_pages()
+        self._fill_screen_app()
+        return self._scrolled_content(content)
+
+    def _screen_titles(self):
+        """Names of the pages: the preview module's when the screen package has one."""
+        try:
+            from screen.preview import PAGE_TITLES
+            return PAGE_TITLES
+        except Exception:  # the package or its libraries may be missing
+            return sp.PAGE_TITLES
+
+    def _screen_model(self):
+        return self._screen_present[0].model if self._screen_present else SPACEPILOT_PRO
+
+    # Visibility and status ----------------------------------------------------------
+
+    def _refresh_screen_presence(self):
+        """The page is shown while a supported screen is plugged in, or settings
+        for it exist (they stay reachable while it is unplugged)."""
+        if self.config is None or self._screen_page is None:
+            return
+        self._screen_present = screens_present()
+        show = (
+            bool(self._screen_present) or sp.settings_customised(self.config)
+            or self._app_settings["show_all_pages"]
+        )
+        if self._screen_page.get_visible() != show:
+            self._screen_page.set_visible(show)
+
+    def _screen_status_group(self):
+        settings = self.config.screen
+        group = Adw.PreferencesGroup(
+            title="Screen",
+            description=(
+                "The colour screen of a 3Dconnexion SpacePilot Pro shows Turnpad: what the function keys do, "
+                "the live dial, the buttons and the motion of the cap. The settings apply at once."
+            ),
+        )
+        rows = self._screen_status_rows
+        rows["device"] = Adw.ActionRow(title="SpaceMouse", subtitle="Unknown")
+        rows["service"] = Adw.ActionRow(title="Screen service", subtitle="Unknown")
+        for row in (rows["device"], rows["service"]):
+            row.set_subtitle_lines(0)
+            group.add(row)
+        rows["usb"] = Adw.ActionRow(
+            title="pyusb is not installed",
+            subtitle=(
+                "The screen service needs the Python USB library: python-pyusb (Arch), python3-usb "
+                "(Debian, Ubuntu) or python3-pyusb (Fedora)."
+            ),
+        )
+        rows["usb"].set_subtitle_lines(0)
+        rows["usb"].add_prefix(Gtk.Image.new_from_icon_name("dialog-warning-symbolic"))
+        rows["usb"].set_visible(sp.pyusb_missing())
+        group.add(rows["usb"])
+        rows["enabled"] = _switch_row(
+            "Show Turnpad on the screen", "Starts or stops the screen service", settings.enabled, self._on_screen_enabled,
+        )
+        group.add(rows["enabled"])
+        return group
+
+    def _refresh_screen_status(self):
+        rows = self._screen_status_rows
+        if not rows:
+            return
+        rows["device"].set_subtitle(sp.connection_text(self._screen_present))
+        rows["usb"].set_visible(sp.pyusb_missing())
+        rows["service"].set_subtitle("Checking…")
+        self._screen_service_state(lambda output: rows["service"].set_subtitle(sp.service_state_text(output)))
+
+    @staticmethod
+    def _screen_service_state(done):
+        """``done(text)`` with what ``systemctl --user is-active`` says ("" = could not ask); never blocks."""
+        try:
+            process = Gio.Subprocess.new(
+                ["systemctl", "--user", "is-active", SCREEN_SERVICE],
+                Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_SILENCE,
+            )
+        except GLib.Error:
+            done("")
+            return
+
+        def finished(process, result):
+            try:
+                _ok, output, _errors = process.communicate_utf8_finish(result)
+            except GLib.Error:
+                output = ""
+            done(output or "")
+
+        process.communicate_utf8_async(None, None, finished)
+
+    def _on_screen_enabled(self, active):
+        settings = self.config.screen
+        if settings.enabled == active:
+            return
+        settings.enabled = active
+        self._screen_sync.mark("enabled")
+        # The service reads the flag when it starts: the file must be written first.
+        if self._save_source:
+            GLib.source_remove(self._save_source)
+        self._save_config()
+        if active and not self._screen_present:
+            return
+        verb = "start" if active else "stop"
+
+        def finished(ok):
+            if not ok:
+                self._toast(f"Could not {verb} {SCREEN_SERVICE}")
+            GLib.timeout_add(1200, lambda: self._refresh_screen_status() or GLib.SOURCE_REMOVE)
+
+        self._spawn(["systemctl", "--user", verb, SCREEN_SERVICE], f"Could not {verb} {SCREEN_SERVICE}", finished)
+
+    # Preview ------------------------------------------------------------------------
+
+    def _screen_preview_group(self):
+        group = Adw.PreferencesGroup(title="Preview", description="What the screen shows, for the application chosen below.")
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        navigation = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8, halign=Gtk.Align.CENTER)
+        navigation.append(_icon_button("go-previous-symbolic", "Previous page", lambda: self._step_screen_preview(-1)))
+        self._screen_preview_title = Gtk.Label(label="", width_chars=18)
+        self._screen_preview_title.add_css_class("heading")
+        navigation.append(self._screen_preview_title)
+        navigation.append(_icon_button("go-next-symbolic", "Next page", lambda: self._step_screen_preview(1)))
+        box.append(navigation)
+        self._screen_preview = Gtk.Picture()
+        self._screen_preview.set_can_shrink(True)
+        self._screen_preview.set_content_fit(Gtk.ContentFit.CONTAIN)
+        self._screen_preview.set_hexpand(True)
+        # The clamp stops the picture at its own size (640 px); narrower, it shrinks.
+        self._screen_preview_frame = _ScreenPicture(self._screen_preview)
+        self._screen_preview_frame.set_visible(False)
+        clamp = Adw.Clamp(maximum_size=640, tightening_threshold=640)
+        clamp.set_child(self._screen_preview_frame)
+        box.append(clamp)
+        self._screen_preview_note = Gtk.Label(label="", wrap=True, xalign=0)
+        self._screen_preview_note.add_css_class("dim-label")
+        box.append(self._screen_preview_note)
+        group.add(box)
+        return group
+
+    def _step_screen_preview(self, delta):
+        order = sp.page_order(sp.effective_pages(self.config, self._screen_scope))
+        if self._screen_preview_page in order:
+            position = order.index(self._screen_preview_page)
+        else:
+            position = 0
+        self._screen_preview_page = order[(position + delta) % len(order)]
+        self._queue_screen_preview(immediately=True)
+
+    def _queue_screen_preview(self, immediately=False):
+        """Render the preview again, a moment after the last change."""
+        if self._screen_preview is None:
+            return
+        if self._screen_preview_source:
+            GLib.source_remove(self._screen_preview_source)
+            self._screen_preview_source = 0
+        if immediately:
+            self._render_screen_preview()
+        else:
+            self._screen_preview_source = GLib.timeout_add(150, self._render_screen_preview)
+
+    def _render_screen_preview(self):
+        self._screen_preview_source = 0
+        picture, note = self._screen_preview, self._screen_preview_note
+        if picture is None or self.config is None:
+            return GLib.SOURCE_REMOVE
+        # Nobody sees it: it is rendered when the page comes up.
+        if self._view_stack is not None and self._view_stack.get_visible_child_name() != "screen":
+            return GLib.SOURCE_REMOVE
+        order = sp.page_order(sp.effective_pages(self.config, self._screen_scope))
+        if self._screen_preview_page not in order:
+            self._screen_preview_page = order[0]
+        page = self._screen_preview_page
+        title = sp.page_title(page, self._screen_titles())
+        self._screen_preview_title.set_label(title if page in sp.effective_pages(self.config, self._screen_scope)
+                                             else f"{title} (hidden)")
+        try:
+            from screen.preview import render
+            profile = self._screen_scope
+            surface = render(self.config, profile.name if profile is not None else None, page, scale=2)
+            surface.flush()
+            texture = Gdk.MemoryTexture.new(
+                surface.get_width(), surface.get_height(), Gdk.MemoryFormat.B8G8R8A8_PREMULTIPLIED,
+                GLib.Bytes.new(bytes(surface.get_data())), surface.get_stride(),
+            )
+        except ImportError:
+            self._screen_preview_frame.set_visible(False)
+            note.set_label("The preview is not available: the screen package is not installed.")
+            note.set_visible(True)
+            return GLib.SOURCE_REMOVE
+        except Exception as error:  # a page that fails to draw must not break the settings
+            self._screen_preview_frame.set_visible(False)
+            note.set_label(f"The preview failed: {error}")
+            note.set_visible(True)
+            return GLib.SOURCE_REMOVE
+        picture.set_paintable(texture)
+        self._screen_preview_frame.set_visible(True)
+        note.set_visible(False)
+        return GLib.SOURCE_REMOVE
+
+    # Look and power -----------------------------------------------------------------
+
+    def _set_screen(self, attribute, value):
+        """Change a setting of config.screen: saved, and the screen service takes it from the file."""
+        settings = self.config.screen
+        if getattr(settings, attribute) == value:
+            return
+        setattr(settings, attribute, value)
+        self._screen_sync.mark(attribute)
+        self._schedule_save()
+        self._queue_screen_preview()
+
+    def _screen_choice_row(self, title, subtitle, choices, attribute):
+        value = getattr(self.config.screen, attribute)
+        choices = sp.choices_with(choices, value)
+        return _combo_row(
+            title, subtitle, [label for _value, label in choices], sp.choice_index(choices, value),
+            lambda index: self._set_screen(attribute, sp.choice_value(choices, index)),
+        )
+
+    def _fill_screen_look(self):
+        box = self._screen_look_box
+        _clear_children(box)
+        settings = self.config.screen
+        look = Adw.PreferencesGroup(title="Look")
+        look.add(_scale_row("Brightness", "", settings.brightness, lambda value: self._set_screen("brightness", value)))
+        look.add(self._screen_choice_row("Theme", "Dial skin uses the colours of the dial", sp.THEME_CHOICES, "theme"))
+        look.add(self._screen_choice_row("Text size", "", sp.TEXT_SIZE_CHOICES, "text_size"))
+        look.add(_switch_row(
+            "Long-press labels", "Show what a long press does on the keys page", settings.show_long,
+            lambda active: self._set_screen("show_long", active),
+        ))
+        look.add(_switch_row(
+            "24-hour clock", "", settings.clock_24h, lambda active: self._set_screen("clock_24h", active),
+        ))
+        look.add(_switch_row(
+            "Press feedback", "Show the action of a pressed button for a moment", settings.press_feedback,
+            lambda active: self._set_screen("press_feedback", active),
+        ))
+        box.append(look)
+
+        power = Adw.PreferencesGroup(title="Power", description="Pressing any button wakes the screen.")
+        dim_brightness = _scale_row(
+            "Dimmed brightness", "", settings.dim_brightness, lambda value: self._set_screen("dim_brightness", value),
+        )
+        dim_brightness.set_sensitive(settings.dim_after_s > 0)
+
+        def dim_after_changed(seconds):
+            self._set_screen("dim_after_s", seconds)
+            dim_brightness.set_sensitive(seconds > 0)
+
+        dim_choices = sp.choices_with(sp.DIM_AFTER_CHOICES, settings.dim_after_s)
+        power.add(_combo_row(
+            "Dim after", "When nothing is pressed", [label for _value, label in dim_choices],
+            sp.choice_index(dim_choices, settings.dim_after_s),
+            lambda index: dim_after_changed(sp.choice_value(dim_choices, index)),
+        ))
+        power.add(dim_brightness)
+        power.add(self._screen_choice_row("Screen off after", "", sp.OFF_AFTER_CHOICES, "off_after_s"))
+        power.add(_switch_row(
+            "Wake on cap motion", "Moving the cap wakes the screen too", settings.wake_on_motion,
+            lambda active: self._set_screen("wake_on_motion", active),
+        ))
+        box.append(power)
+
+    # Pages --------------------------------------------------------------------------
+
+    def _fill_screen_pages(self):
+        box = self._screen_pages_box
+        _clear_children(box)
+        settings = self.config.screen
+        titles = self._screen_titles()
+        pages = sp.shown_pages(settings.pages) or list(SCREEN_PAGES)
+        group = Adw.PreferencesGroup(
+            title="Pages", description="Which pages the screen shows and in what order. The Menu key of the screen lists them.",
+        )
+        self._screen_page_buttons = {}
+        order = sp.page_order(pages)
+        for position, page in enumerate(order):
+            shown = page in pages
+            row = Adw.ActionRow(title=sp.page_title(page, titles), subtitle=sp.PAGE_HINTS.get(page, ""))
+            row.set_subtitle_lines(1)
+            switch = Gtk.Switch(active=shown, valign=Gtk.Align.CENTER)
+            switch.connect("notify::active", lambda switch, _param, page=page: self._on_screen_page_toggled(page, switch))
+            up = _icon_button("go-up-symbolic", "Move up", lambda page=page: self._move_screen_page(page, -1))
+            down = _icon_button("go-down-symbolic", "Move down", lambda page=page: self._move_screen_page(page, 1))
+            up.set_sensitive(shown and pages.index(page) > 0)
+            down.set_sensitive(shown and pages.index(page) < len(pages) - 1)
+            self._screen_page_buttons[(page, -1)] = up
+            self._screen_page_buttons[(page, 1)] = down
+            row.add_suffix(up)
+            row.add_suffix(down)
+            row.add_suffix(switch)
+            row.set_activatable_widget(switch)
+            group.add(row)
+        start_labels = [sp.page_title(page, titles) for page in pages]
+        group.add(_combo_row(
+            "Start page", "Shown first and after the screen wakes", start_labels,
+            pages.index(sp.fix_start_page(pages, settings.start_page)),
+            lambda index: self._set_screen("start_page", pages[index]) if index < len(pages) else None,
+        ))
+        group.add(_switch_row(
+            "Show the dial while it is on", "The dial page appears when the dial turns on, then the previous page",
+            settings.follow_dial, lambda active: self._set_screen("follow_dial", active),
+        ))
+        box.append(group)
+
+    def _set_screen_pages(self, pages, focus=None):
+        settings = self.config.screen
+        pages = sp.shown_pages(pages)
+        if not pages:
+            return
+        settings.pages = pages
+        settings.start_page = sp.fix_start_page(pages, settings.start_page)
+        self._screen_sync.mark("pages", "start_page")
+        self._schedule_save()
+
+        def refill():
+            self._fill_screen_pages()
+            self._fill_screen_app()
+            if focus in self._screen_page_buttons:
+                self._screen_page_buttons[focus].grab_focus()
+            return GLib.SOURCE_REMOVE
+
+        # Not inside the signal of a widget that is replaced.
+        GLib.idle_add(refill)
+        self._queue_screen_preview()
+
+    def _on_screen_page_toggled(self, page, switch):
+        settings = self.config.screen
+        pages = sp.shown_pages(settings.pages) or list(SCREEN_PAGES)
+        changed = sp.toggle_page(pages, page, switch.get_active())
+        if changed == pages:
+            if (page in pages) != switch.get_active():
+                # The last page cannot be hidden.
+                GLib.idle_add(lambda: self._fill_screen_pages() or GLib.SOURCE_REMOVE)
+            return
+        self._set_screen_pages(changed)
+
+    def _move_screen_page(self, page, delta):
+        pages = sp.shown_pages(self.config.screen.pages) or list(SCREEN_PAGES)
+        moved = sp.move_page(pages, page, delta)
+        if moved != pages:
+            self._set_screen_pages(moved, focus=(page, delta))
+
+    # Per application ----------------------------------------------------------------
+
+    def _screen_app_group(self):
+        """The "Applies to" row (kept) and the box under it that is filled again per scope."""
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18)
+        group = Adw.PreferencesGroup(
+            title="Per application",
+            description="Labels of the function keys and, for an application, its own start page, pages and colour.",
+        )
+        self._screen_scope_row = Adw.ComboRow(
+            title="Applies to", subtitle="Pages and colour follow the focused application",
+            model=Gtk.StringList.new(["All applications"]),
+        )
+        self._screen_scope_handler = self._screen_scope_row.connect("notify::selected", self._on_screen_scope)
+        group.add(self._screen_scope_row)
+        box.append(group)
+        self._screen_app_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18)
+        box.append(self._screen_app_box)
+        return box
+
+    def _refresh_screen_page(self):
+        """Follow profiles that were added, renamed or removed."""
+        if self._screen_app_box is None or self.config is None:
+            return
+        if self._screen_scope is not None and self._screen_scope not in self.config.profiles:
+            self._screen_scope = None
+        labels = ["All applications"] + [
+            profile.name if profile.app_id is None else f"{profile.name}  ·  app" for profile in self.config.profiles
+        ]
+        row = self._screen_scope_row
+        row.handler_block(self._screen_scope_handler)
+        row.set_model(Gtk.StringList.new(labels))
+        row.set_selected(0 if self._screen_scope is None else self.config.profiles.index(self._screen_scope) + 1)
+        row.handler_unblock(self._screen_scope_handler)
+        self._fill_screen_app()
+        self._queue_screen_preview()
+
+    def _on_screen_scope(self, row, _param):
+        index = row.get_selected()
+        profiles = self.config.profiles if self.config is not None else []
+        scope = profiles[index - 1] if 1 <= index <= len(profiles) else None
+        if scope is not self._screen_scope:
+            self._screen_scope = scope
+            self._fill_screen_app()
+            self._queue_screen_preview()
+
+    def _screen_override_changed(self):
+        # Not inside the signal of a widget that is replaced.
+        GLib.idle_add(lambda: self._fill_screen_app() or GLib.SOURCE_REMOVE)
+        self._schedule_save()
+        self._queue_screen_preview()
+
+    def _fill_screen_app(self):
+        box = self._screen_app_box
+        if box is None or self.config is None:
+            return
+        _clear_children(box)
+        profile = self._screen_scope
+        titles = self._screen_titles()
+        if profile is not None:
+            group = Adw.PreferencesGroup(title=f"Screen in {profile.name}")
+            effective = sp.effective_pages(self.config, profile)
+            # Start page: the profile's own, or the one of all applications.
+            current = profile.screen.get("start_page")
+            options = list(effective) + ([current] if current and current not in effective else [])
+            group.add(_combo_row(
+                "Start page", "Shown first when this application is active",
+                ["Same as all applications"] + [sp.page_title(page, titles) for page in options],
+                0 if current is None else 1 + options.index(current),
+                lambda index: self._set_screen_override(profile, "start_page", options[index - 1] if index else None),
+            ))
+            own = "pages" in profile.screen
+            group.add(_switch_row(
+                "Own pages", "Off: the pages of All applications", own,
+                lambda active: self._set_screen_override(
+                    profile, "pages", sp.shown_pages(self.config.screen.pages) or list(SCREEN_PAGES) if active else None),
+            ))
+            if own:
+                for page in SCREEN_PAGES:
+                    group.add(_switch_row(
+                        sp.page_title(page, titles), "", page in profile.screen["pages"],
+                        lambda active, page=page: self._toggle_screen_override_page(profile, page, active),
+                    ))
+            group.add(self._screen_accent_row(profile))
+            box.append(group)
+        box.append(self._screen_labels_group(profile))
+
+    def _set_screen_override(self, profile, key, value):
+        before = dict(profile.screen)
+        sp.set_override(profile, key, value)
+        if profile.screen != before:
+            self._screen_override_changed()
+
+    def _toggle_screen_override_page(self, profile, page, active):
+        pages = sp.shown_pages(profile.screen.get("pages"))
+        changed = sp.toggle_page(pages, page, active, reference=self.config.screen.pages)
+        if changed == pages:
+            # The last page cannot be hidden: show the switch as it was.
+            GLib.idle_add(lambda: self._fill_screen_app() or GLib.SOURCE_REMOVE)
+            return
+        sp.set_override(profile, "pages", changed)
+        self._screen_override_changed()
+
+    @staticmethod
+    def _colour_button(rgba, changed):
+        """A colour chooser button (Gtk.ColorDialogButton, else Gtk.ColorButton); returns
+        (button, set_colour) where set_colour changes it without calling ``changed(hex)``."""
+        quiet = {"on": False}
+        if hasattr(Gtk, "ColorDialogButton"):
+            button = Gtk.ColorDialogButton.new(Gtk.ColorDialog(with_alpha=False))
+            button.set_rgba(rgba)
+            button.connect("notify::rgba", lambda button, _param: None if quiet["on"] else changed(_rgba_to_hex(button.get_rgba())))
+        else:
+            button = Gtk.ColorButton.new_with_rgba(rgba)
+            button.connect("color-set", lambda button: None if quiet["on"] else changed(_rgba_to_hex(button.get_rgba())))
+        button.set_valign(Gtk.Align.CENTER)
+
+        def set_colour(colour):
+            quiet["on"] = True
+            new = Gdk.RGBA()
+            new.parse(colour)
+            button.set_rgba(new)
+            quiet["on"] = False
+
+        return button, set_colour
+
+    def _screen_accent_row(self, profile):
+        row = Adw.ActionRow(title="Accent colour", subtitle="Colours the screen while this application is active")
+        accent = profile.screen.get("accent")
+        rgba = Gdk.RGBA()
+        rgba.parse(accent or self.config.overlay.accent or DEFAULT_ACCENT)
+        reset = _icon_button("edit-undo-symbolic", "Back to the dial's accent colour", lambda: None)
+        reset.set_sensitive(accent is not None)
+
+        def chosen(colour):
+            sp.set_override(profile, "accent", colour)
+            reset.set_sensitive(True)
+            self._schedule_save()
+            self._queue_screen_preview()
+
+        button, set_colour = self._colour_button(rgba, chosen)
+
+        def reset_clicked():
+            sp.set_override(profile, "accent", None)
+            set_colour(self.config.overlay.accent or DEFAULT_ACCENT)
+            reset.set_sensitive(False)
+            self._schedule_save()
+            self._queue_screen_preview()
+
+        reset.connect("clicked", lambda _button: reset_clicked())
+        row.add_suffix(reset)
+        row.add_suffix(button)
+        return row
+
+    def _screen_labels_group(self, profile):
+        """Text for the function keys on the screen instead of the automatic one."""
+        group = Adw.PreferencesGroup()
+        expander = Adw.ExpanderRow(
+            title="Function key labels",
+            subtitle="Text under each key on the screen. Empty: automatic, from what the key does.",
+        )
+        model = self._screen_model()
+        for key in sp.function_keys(model):
+            for index, kind in ((key.index, "short press"), (key.long_index, "long press")):
+                if index is None:
+                    continue
+                entry = Adw.EntryRow(title=f"{key.name} · {kind}")
+                entry.set_show_apply_button(True)
+                entry.set_text(sp.label_of(self.config, profile, index))
+                automatic = sp.auto_text(self.config, profile, index)
+                entry.set_tooltip_text(f"Automatic: {automatic}")
+                try:
+                    entry.get_delegate().set_placeholder_text(automatic)
+                except (AttributeError, TypeError):
+                    pass
+                entry.connect("apply", lambda entry, index=index: self._apply_screen_label(entry, profile, index))
+                expander.add_row(entry)
+        group.add(expander)
+        return group
+
+    def _apply_screen_label(self, entry, profile, index):
+        text = sp.clean_label(entry.get_text())
+        entry.set_text(text)
+        if sp.set_label(self.config, profile, index, text):
+            self._rebuild_spacemouse_rows()
+            self._schedule_save()
+            self._queue_screen_preview()
+
+    def _screen_keys_group(self):
+        group = Adw.PreferencesGroup(title="Keys around the screen")
+        for key, text in sp.SCREEN_KEY_HELP:
+            row = Adw.ActionRow(title=key, subtitle=text)
+            row.set_subtitle_lines(1)
+            group.add(row)
+        return group
+
+    # An external change (the screen service saves quick settings) ----------------------
+
+    def _watch_config_file(self):
+        try:
+            self._screen_monitor = Gio.File.new_for_path(str(CONFIG_FILE)).monitor_file(Gio.FileMonitorFlags.NONE, None)
+        except GLib.Error:
+            self._screen_monitor = None
+            return
+        self._screen_monitor.connect("changed", self._on_config_file_changed)
+
+    def _on_config_file_changed(self, _monitor, _file, _other, event):
+        if event not in (
+            Gio.FileMonitorEvent.CHANGES_DONE_HINT, Gio.FileMonitorEvent.CREATED,
+            Gio.FileMonitorEvent.RENAMED, Gio.FileMonitorEvent.MOVED_IN,
+        ):
+            return
+        if self._screen_reload_source:
+            GLib.source_remove(self._screen_reload_source)
+        self._screen_reload_source = GLib.timeout_add(400, self._reload_screen_from_disk)
+
+    def _reload_screen_from_disk(self):
+        """Take the ``screen`` section another program saved. Fields changed in this
+        window and not saved yet stay as they are (they are written with the next save)."""
+        self._screen_reload_source = 0
+        self._adopt_screen_from_disk()
+        return GLib.SOURCE_REMOVE
+
+    def _adopt_screen_from_disk(self):
+        """Read ``config.screen`` from the file again, keeping what this window changed.
+        Returns whether the settings changed (the page is filled again then)."""
+        if self.config is None:
+            return False
+        stored = sp.read_screen(CONFIG_FILE)
+        if stored is None:
+            return False
+        adopted = self._screen_sync.adopt(self.config.screen, stored)
+        if adopted is None:
+            return False
+        self.config.screen = adopted
+        self._fill_screen_look()
+        self._fill_screen_pages()
+        self._fill_screen_app()
+        self._queue_screen_preview()
+        self._refresh_screen_presence()
+        return True
+
+    def _on_window_active(self, window, _param):
+        if window.is_active():
+            self._adopt_screen_from_disk()
 
     def _build_diagnostics_page(self):
         content = self._page_box()
@@ -4288,8 +5195,16 @@ class Application(Adw.Application):
         refresh = _icon_button("view-refresh-symbolic", "Refresh", self._refresh_diagnostics)
         status.set_header_suffix(refresh)
         content.append(status)
+        content.append(self._devices_group())
         content.append(self._emulation_group())
         content.append(self._mouse_group())
+        self._openers_group = Adw.PreferencesGroup()
+        hint = Adw.ActionRow(title=hw.TWO_OPENERS_HINT)
+        hint.set_title_lines(0)
+        hint.add_prefix(Gtk.Image.new_from_icon_name("dialog-warning-symbolic"))
+        self._openers_group.add(hint)
+        content.append(self._openers_group)
+        self._update_openers_hint()
 
         tools = Adw.PreferencesGroup(title="Tools")
         reload_row = Adw.ActionRow(title="Reload configuration", subtitle="The driver normally reloads after every change")
@@ -4307,8 +5222,224 @@ class Application(Adw.Application):
         )
         folder_row.add_suffix(open_button)
         tools.add(folder_row)
+        export_row = Adw.ActionRow(
+            title="Export all settings",
+            subtitle="Profiles, dial look, gesture feel and SpaceMouse buttons as a file for another computer; "
+            "the touchpad, devices and modes of this computer are not included",
+        )
+        export_row.set_subtitle_lines(0)
+        export_button = Gtk.Button(label="Export…")
+        export_button.set_valign(Gtk.Align.CENTER)
+        export_button.connect("clicked", lambda _button: self._export_settings())
+        export_row.add_suffix(export_button)
+        tools.add(export_row)
+        import_row = Adw.ActionRow(
+            title="Import settings",
+            subtitle="Replaces the profiles and looks with the ones of an exported file; "
+            "this computer's own devices and modes stay",
+        )
+        import_row.set_subtitle_lines(0)
+        import_button = Gtk.Button(label="Import…")
+        import_button.set_valign(Gtk.Align.CENTER)
+        import_button.connect("clicked", lambda _button: self._import_settings())
+        import_row.add_suffix(import_button)
+        tools.add(import_row)
         content.append(tools)
         return self._scrolled_content(content)
+
+    def _devices_group(self):
+        """Detecting the hardware again and which pages to show."""
+        group = Adw.PreferencesGroup(title="This computer")
+        row = Adw.ActionRow(
+            title="Set up devices again",
+            subtitle="Looks for a DialPad, touchpad, mouse and SpaceMouse and suggests the modes",
+        )
+        row.set_subtitle_lines(0)
+        button = Gtk.Button(label="Set up…")
+        button.set_valign(Gtk.Align.CENTER)
+        button.connect("clicked", lambda _button: self._show_setup_assistant())
+        row.add_suffix(button)
+        group.add(row)
+        group.add(_switch_row(
+            "Show all pages",
+            "Also show the pages for hardware this computer does not seem to have (Calibration, SpaceMouse, Screen)",
+            self._app_settings["show_all_pages"], self._on_show_all_pages,
+        ))
+        return group
+
+    def _on_show_all_pages(self, active):
+        if self._app_settings["show_all_pages"] == active:
+            return
+        self._app_settings["show_all_pages"] = active
+        if not hw.save_app_settings(self._app_settings):
+            self._toast("Could not save this preference")
+        self._update_page_visibility()
+
+    def _update_page_visibility(self):
+        """Show the pages that can do something with this computer's hardware
+        (see hardware.page_visibility); the page being looked at stays."""
+        if self.config is None or not self._view_pages:
+            return
+        shown = hw.page_visibility(
+            self.config, self._found, self._driver_status, self._app_settings["show_all_pages"],
+        )
+        current = self._view_stack.get_visible_child_name() if self._view_stack is not None else None
+        for name, show in shown.items():
+            page = self._view_pages.get(name)
+            if page is not None and page.get_visible() != show and (show or name != current):
+                page.set_visible(show)
+        self._refresh_screen_presence()
+
+    def _update_openers_hint(self):
+        if self._openers_group is not None and self.config is not None:
+            self._openers_group.set_visible(hw.two_openers(self.config))
+
+    def _rescan_hardware(self):
+        self._found = hw.detect(status=self._driver_status)
+        self._update_page_visibility()
+        return self._found
+
+    # --- Pages built again ------------------------------------------------------------------
+
+    def _rebuild_page(self, name):
+        """Build a page again from the configuration: after something other than
+        the page changed what its widgets show."""
+        bin_ = self._page_bins.get(name)
+        builder = next((entry[3] for entry in self.PAGES if entry[0] == name), None)
+        if bin_ is None or builder is None:
+            return
+        if name == "spacemouse":
+            self._stop_spacemouse_probe()
+        bin_.set_child(getattr(self, builder)())
+
+    def _rebuild_all_pages(self):
+        """All pages, after ``self.config`` was replaced."""
+        self._stop_spacemouse_probe()
+        self._selected_profile = self._default_profile()
+        self._sm_scope = None
+        self._sm_layer = None
+        self._screen_scope = None
+        self._preview_title = None
+        self._sm_extra_buttons = set()
+        for entry in self.PAGES:
+            self._rebuild_page(entry[0])
+        self._refresh_all()
+        self._refresh_diagnostics()
+        self._update_page_visibility()
+
+    # --- Setup assistant -----------------------------------------------------------------------
+
+    def _show_setup_assistant(self):
+        if self.config is None or self._window is None:
+            return
+        self._rescan_hardware()
+        assistant = SetupAssistant(
+            self.config, self._found, self._rescan_hardware, self._finish_setup, self._dismiss_setup, self._toast,
+        )
+        self._setup_assistant = assistant
+        assistant.present(self._window)
+
+    def _finish_setup(self, main, spacemouse, device, toggle_key):
+        config = self.config
+        changed = hw.apply_modes(config, main, spacemouse)
+        if config.mouse.enabled and (config.mouse.device, config.mouse.toggle_key) != (device, toggle_key):
+            changed = True
+        config.mouse.device, config.mouse.toggle_key = device, toggle_key
+        config.setup_done = True
+        self._rebuild_page("diagnostics")
+        self._rebuild_page("spacemouse")
+        self._refresh_diagnostics()
+        self._update_page_visibility()
+        if changed:
+            self._restart_driver()
+        else:
+            self._schedule_save()
+
+    def _dismiss_setup(self):
+        """The assistant was closed without applying: it does not come back by itself."""
+        if self.config is not None and not self.config.setup_done:
+            self.config.setup_done = True
+            self._schedule_save()
+
+    # --- All settings: export and import ---------------------------------------------------------
+
+    def _export_settings(self):
+        dialog = Gtk.FileDialog(title="Export all settings", initial_name="turnpad-settings.json")
+
+        def finish(file_dialog, result):
+            try:
+                file = file_dialog.save_finish(result)
+            except GLib.Error:
+                return
+            try:
+                Path(file.get_path()).write_text(json.dumps(settings_document(self.config), indent=2) + "\n")
+            except OSError as error:
+                self._toast(f"Export failed: {error.strerror}")
+                return
+            self._toast("Exported the settings")
+
+        dialog.save(self._window, None, finish)
+
+    def _import_settings(self):
+        dialog = Gtk.FileDialog(title="Import settings")
+        filters = Gio.ListStore.new(Gtk.FileFilter)
+        json_filter = Gtk.FileFilter()
+        json_filter.set_name("JSON")
+        json_filter.add_suffix("json")
+        filters.append(json_filter)
+        dialog.set_filters(filters)
+
+        def finish(file_dialog, result):
+            try:
+                file = file_dialog.open_finish(result)
+            except GLib.Error:
+                return
+            try:
+                text = Path(file.get_path()).read_text()
+            except (OSError, UnicodeDecodeError) as error:
+                self._toast(f"Import failed: {getattr(error, 'strerror', None) or error}")
+                return
+            self._offer_settings(text)
+
+        dialog.open(self._window, None, finish)
+
+    def _offer_settings(self, text):
+        """Check an exported settings file, show what it changes and ask."""
+        try:
+            merged = merge_portable(self.config, settings_from_text(text))
+        except ConfigError as error:
+            alert = Adw.AlertDialog(heading="Not a usable settings file", body=str(error))
+            alert.add_response("close", "Close")
+            alert.present(self._window)
+            return
+        changes = describe_changes(self.config, merged)
+        if not changes:
+            self._toast("Nothing to import: these settings are the same")
+            return
+        body = (
+            "This replaces:\n" + "\n".join(f"• {line}" for line in changes)
+            + "\n\nThe touchpad, devices and modes of this computer stay as they are."
+        )
+        # Commands already in the settings here are no news; the new ones are asked about.
+        known = set(shell_commands(self.config.profiles, self.config.spacemouse.buttons, self.config.spacemouse.layers))
+        self._confirm_profiles(
+            merged.profiles, lambda _response: self._apply_settings(merged),
+            heading="Import these settings?", body=body, responses={"import": "Import"},
+            spacemouse_buttons=merged.spacemouse.buttons, known_commands=known,
+            spacemouse_layers=merged.spacemouse.layers,
+        )
+
+    def _apply_settings(self, merged):
+        before = portable_config(self.config)["spacemouse"]
+        self.config = merged
+        self._screen_sync.mark(*sp.SCREEN_FIELDS)
+        self._rebuild_all_pages()
+        self._toast("Imported the settings")
+        if before != portable_config(merged)["spacemouse"] and merged.spacemouse.enabled:
+            # The driver reads the SpaceMouse settings when it starts.
+            self._restart_driver()
+        else:
+            self._reload_driver()
 
     def _emulation_group(self):
         """Emulated dial for touchpads without a DialPad, and the toggle shortcut."""
@@ -4383,6 +5514,7 @@ class Application(Adw.Application):
                 row.set_sensitive(active)
             if mouse.enabled != active:
                 mouse.enabled = active
+                self._update_openers_hint()
                 # The driver opens its devices at start.
                 self._restart_driver()
 
@@ -4391,38 +5523,12 @@ class Application(Adw.Application):
             mouse.enabled, enabled_changed,
         ))
 
-        key_row = Adw.EntryRow(title="Toggle key, e.g. F13, KEY_3 or BTN_SIDE")
-        key_row.set_text(mouse.toggle_key)
-        key_row.set_show_apply_button(True)
+        def picked(_attribute):
+            # The driver opens its devices at start.
+            self._restart_driver() if mouse.enabled else self._schedule_save()
 
-        def key_applied(row):
-            name = normalize_key_name(row.get_text(), "")
-            # Keys come from the evdev table; mouse buttons cannot be checked here.
-            if name not in KNOWN_KEYS and not name.startswith("BTN_"):
-                row.add_css_class("error")
-                self._toast(f"“{row.get_text().strip()}” is not a key name")
-                return
-            row.remove_css_class("error")
-            row.set_text(name)
-            if mouse.toggle_key != name:
-                mouse.toggle_key = name
-                self._restart_driver() if mouse.enabled else self._schedule_save()
-
-        key_row.connect("apply", key_applied)
-        options.append(key_row)
-
-        device_row = Adw.EntryRow(title="Mouse name (part of it; empty: automatic)")
-        device_row.set_text(mouse.device)
-        device_row.set_show_apply_button(True)
-
-        def device_applied(row):
-            name = row.get_text().strip()
-            if mouse.device != name:
-                mouse.device = name
-                self._restart_driver() if mouse.enabled else self._schedule_save()
-
-        device_row.connect("apply", device_applied)
-        options.append(device_row)
+        self._mouse_picker = MousePicker(mouse, picked, self._window, self._toast)
+        options.extend(self._mouse_picker.rows)
 
         def apply_mouse_setting(attribute, value):
             if getattr(mouse, attribute) != value:
@@ -4529,6 +5635,11 @@ class Application(Adw.Application):
         return value.unpack() if isinstance(value, GLib.Variant) else value
 
     def _refresh_diagnostics(self):
+        self._refresh_screen_presence()
+        if self._mouse_picker is not None:
+            # A mouse plugged in since the page was built.
+            self._mouse_picker.refresh()
+        self._rescan_hardware()
         rows = self._diagnostics_rows
         if not rows:
             return
@@ -4548,12 +5659,16 @@ class Application(Adw.Application):
             status = {key: self._unpack_dbus_value(value) for key, value in status.items()}
         except (GLib.Error, RuntimeError) as error:
             rows["service"].set_subtitle(f"Unavailable: {getattr(error, 'message', error)}")
+            self._driver_status = None
+            self._update_page_visibility()
             self._update_spacemouse_status(None)
             for key in ("enabled", "application", "profile", "function", "environment", "touchpad", "configuration"):
                 rows[key].set_subtitle("Unknown")
             return
 
         rows["service"].set_subtitle("Connected")
+        self._driver_status = status
+        self._update_page_visibility()
         self._update_spacemouse_status(status)
         rows["enabled"].set_subtitle("On" if status.get("enabled") else "Off")
         rows["application"].set_subtitle(str(status.get("application") or "None"))

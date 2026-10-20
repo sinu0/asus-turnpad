@@ -45,8 +45,15 @@ REQ_GET_EVMASK = 0x1004
 REQ_DEV_NAME = 0x2000
 REQ_DEV_NAXES = 0x2002
 REQ_DEV_NBUTTONS = 0x2003
+# Global for every client and not saved by the daemon (Turnpad never sends the
+# save, restore or reset requests, 0x3ffe and up). The cooked motion other
+# programs read is the raw one times the sensitivity times the axis sensitivity.
 REQ_SCFG_SENS = 0x3000
 REQ_GCFG_SENS = 0x3001
+REQ_SCFG_SENS_AXIS = 0x3002
+REQ_GCFG_SENS_AXIS = 0x3003
+REQ_SCFG_INVERT = 0x3006
+REQ_GCFG_INVERT = 0x3007
 REQ_SCFG_BNMAP = 0x300A
 REQ_GCFG_BNMAP = 0x300B
 REQ_CHANGE_PROTO = 0x5500
@@ -366,6 +373,22 @@ class SpacenavClient:
     def set_sensitivity(self, value):
         return self.request(REQ_SCFG_SENS, [float_to_bits(value)]) is not None
 
+    def get_axis_sensitivity(self):
+        """The six per-axis sensitivities (X Y Z, then RX RY RZ) or None."""
+        response = self.request(REQ_GCFG_SENS_AXIS)
+        return [bits_to_float(bits) for bits in response.data[:6]] if response is not None else None
+
+    def set_axis_sensitivity(self, values):
+        return self.request(REQ_SCFG_SENS_AXIS, [float_to_bits(value) for value in values[:6]]) is not None
+
+    def get_invert(self):
+        """Which of the six axes spacenavd inverts, or None."""
+        response = self.request(REQ_GCFG_INVERT)
+        return [bool(value) for value in response.data[:6]] if response is not None else None
+
+    def set_invert(self, flags):
+        return self.request(REQ_SCFG_INVERT, [1 if flag else 0 for flag in flags[:6]]) is not None
+
     def get_button_map(self, button):
         response = self.request(REQ_GCFG_BNMAP, [button])
         return response.data[1] if response is not None else None
@@ -376,7 +399,7 @@ class SpacenavClient:
 
 class RestoreFile:
     """What a run changed in spacenavd (its sensitivity while other programs
-    are muted, remapped buttons), kept in a small JSON file so the next start
+    are muted, remapped buttons, the cap's motion settings), kept in a small JSON file so the next start
     can undo it after a crash."""
 
     def __init__(self, path):

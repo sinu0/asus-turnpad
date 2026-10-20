@@ -29,6 +29,8 @@ LIBRARIES = {
     "Xlib": ("x11libs", {"apt": "python3-xlib", "dnf": "python3-xlib", "pacman": "python-xlib", "zypper": "python3-python-xlib"}),
     "xcffib": ("x11libs", {"apt": "python3-xcffib", "dnf": "python3-xcffib", "pacman": "python-xcffib", "zypper": "python3-xcffib"}),
     "systemd": ("systemd", {"apt": "python3-systemd", "dnf": "python3-systemd", "pacman": "python-systemd", "zypper": "python3-systemd"}),
+    # The screen of a SpacePilot Pro (screen/); optional.
+    "usb": ("screen", {"apt": "python3-usb", "dnf": "python3-pyusb", "pacman": "python-pyusb", "zypper": "python3-pyusb"}),
     "PySide6": ("ui", {"apt": "python3-pyside6.qtwidgets", "dnf": "python3-pyside6", "pacman": "pyside6", "zypper": "python3-pyside6"}),
 }
 
@@ -58,7 +60,7 @@ TYPELIBS = {
 def shipped_modules():
     """Python files install.sh copies to the program directory."""
     files = list(ROOT.glob("*.py"))
-    for package in ("config", "config_app", "desktop", "overlay", "layouts"):
+    for package in ("config", "config_app", "desktop", "overlay", "layouts", "screen"):
         files += (ROOT / package).glob("*.py")
     return files
 
@@ -106,7 +108,7 @@ class InstallTest(unittest.TestCase):
         # The packages take every module next to the driver but that one.
         self.assertIn("for module in *.py; do", packaged)
         self.assertIn("$module == dialpad_ui.py ]] || MODULES+=", packaged)
-        for package in ("config", "config_app", "desktop", "layouts", "overlay"):
+        for package in ("config", "config_app", "desktop", "layouts", "overlay", "screen"):
             with self.subTest(package=package):
                 if package != "config_app":  # listed one by one, see below
                     self.assertIn(f"{package}/*.py", installer)
@@ -114,6 +116,9 @@ class InstallTest(unittest.TestCase):
         for name in sorted(path.name for path in EXTENSION.iterdir() if path.suffix in {".js", ".json", ".css"}):
             with self.subTest(file=name):
                 self.assertRegex(packaged, rf"gnome/extension/\{{[^}}]*\b{re.escape(name)}\b")
+        # The Blender add-on, py and toml, in the installer and the packages.
+        self.assertIn("integrations/blender/turnpad/*.py integrations/blender/turnpad/*.toml", installer)
+        self.assertIn("integrations/blender/turnpad/*.py integrations/blender/turnpad/*.toml", packaged)
         for name in ("laptop_touchpad_dialpad_layouts.csv", "config_app/icon.svg", "config_app/style.css"):
             with self.subTest(file=name):
                 self.assertIn(name, installer)
@@ -181,7 +186,7 @@ class DistributionPackagesTest(unittest.TestCase):
         for template in sorted(ROOT.glob("*.service")):
             with self.subTest(service=template.name):
                 self.assertRegex(template.read_text(),
-                                 r"(?m)^ExecStart=\$PYTHON \$INSTALL_DIR_PATH/(dialpad(_ui)?|overlay/layer_shell)\.py\b")
+                                 r"(?m)^ExecStart=\$PYTHON \$INSTALL_DIR_PATH/(dialpad(_ui)?|overlay/layer_shell|screen/service)\.py\b")
         for unit in sorted((ROOT / "packaging").glob("*.service")):
             with self.subTest(service=unit.name):
                 self.assertRegex(unit.read_text(), r"(?m)^ExecStart=/usr/bin/python3 /usr/share/asus-turnpad/")
@@ -196,6 +201,38 @@ class DistributionPackagesTest(unittest.TestCase):
                              "NoNewPrivileges=yes", "WantedBy=graphical-session.target"):
                     self.assertIn(f"\n{line}\n", text)
                 self.assertRegex(text, r"(?m)^After=graphical-session\.target\b")
+
+    def test_screen_service(self):
+        # Started by the udev rule of the SpacePilot Pro, so no [Install]
+        # section and no graphical-session.target; exit status 3 = nothing to
+        # do (no screen, no pyusb, switched off): never restarted.
+        rule = 'ATTR{idVendor}=="046d", ATTR{idProduct}=="c629", TAG+="uaccess", TAG+="systemd", ENV{SYSTEMD_USER_WANTS}+="asus-turnpad-screen.service"'
+        for unit in (ROOT / "asus-turnpad-screen.service", ROOT / "packaging" / "asus-turnpad-screen.service"):
+            text = unit.read_text()
+            with self.subTest(service=str(unit.relative_to(ROOT))):
+                self.assertRegex(text, r"(?m)^ExecStart=(\$PYTHON \$INSTALL_DIR_PATH|/usr/bin/python3 /usr/share/asus-turnpad)/screen/service\.py$")
+                for line in ("Description=Turnpad on the SpaceMouse screen", "Restart=on-failure", "RestartSec=2",
+                             "RestartPreventExitStatus=3", "NoNewPrivileges=yes"):
+                    self.assertIn(f"\n{line}\n", text)
+                self.assertNotRegex(text, r"(?m)^\[Install\]")
+                self.assertNotRegex(text, r"(?m)^[^#\n]*graphical-session")
+                # Not for the user managers of system users (the greeters of gdm and sddm).
+                self.assertIn("\nConditionUser=!@system\n", text)
+                self.assertLess(text.index("ConditionUser=!@system"), text.index("[Service]"))
+                self.assertNotIn("Commands of dial actions", text)
+        for rules in ("packaging/70-asus-turnpad.rules", "install_user_groups.sh"):
+            with self.subTest(rules=rules):
+                body = (ROOT / rules).read_text()
+                self.assertIn('ACTION!="remove", SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ' + (rule if rules.endswith(".rules")
+                              else rule.replace("asus-turnpad-screen.service", "'\"$SCREEN_SERVICE\"'")), body)
+        installer = (ROOT / "install.sh").read_text()
+        self.assertIn("source install_screen.sh", installer)
+        self.assertLess(installer.index("source install_overlay.sh"), installer.index("source install_screen.sh"))
+        self.assertIn("$(packages screen)", installer)
+        self.assertIn('install_unit "$SCREEN_SERVICE" "$SCREEN_SERVICE"', (ROOT / "install_screen.sh").read_text())
+        self.assertIn('"$SCREEN_SERVICE"', (ROOT / "uninstall.sh").read_text())
+        self.assertIn('"$UDEV_RULE_SCREEN"', (ROOT / "uninstall.sh").read_text())
+        self.assertIn("screen/*.py", installer)
 
     def test_overlay_per_desktop(self):
         overlay = (ROOT / "install_overlay.sh").read_text()
@@ -218,14 +255,14 @@ class DistributionPackagesTest(unittest.TestCase):
         managers = sorted({manager for manager, _ in groups})
         names = sorted({group for _, group in groups})
         self.assertEqual(names, sorted(["required", "x11", "plasma", "optional", "wayland", "x11libs", "systemd", "ui",
-                                                "layershell"]))
+                                                "layershell", "screen"]))
         for manager in managers:
             for group in names:
                 with self.subTest(manager=manager, group=group):
                     self.assertIn((manager, group), groups)
 
     def test_every_imported_library_has_a_package(self):
-        local = {path.stem for path in ROOT.glob("*.py")} | {"config", "config_app", "desktop", "overlay", "layouts"}
+        local = {path.stem for path in ROOT.glob("*.py")} | {"config", "config_app", "desktop", "overlay", "layouts", "screen"}
         imported = {}
         for path in shipped_modules():
             for node in ast.walk(ast.parse(path.read_text())):

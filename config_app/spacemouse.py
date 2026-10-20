@@ -9,6 +9,7 @@ global entry of the same button as a whole, as the driver does.
 import copy
 import os
 import threading
+from dataclasses import dataclass
 
 from gi.repository import GLib
 
@@ -19,19 +20,25 @@ from config.schema import (
     SpaceMouseAction,
     SpaceMouseButton,
     default_spacemouse_buttons,
+    merge_spacemouse_buttons,
+    spacemouse_buttons_for,
+)
+from spacemouse_devices import (
+    GROUP_LABELS,
+    GROUPS,
+    SPACEPILOT_PRO,
+    Key,
+    Model,
+    generic_model,
+    key_for_index,
+    model_for_name,
 )
 from spacenav_client import EVMASK_RAWBUTTON, UEV_PRESS, UEV_RAWBUTTON, SpacenavClient, socket_candidates
 
-# Buttons of the SpacePilot Pro; raw indexes as spacenavd reports them. Some
-# labels are guessed: correct them here.
+# Buttons listed when no device says how many it has (the SpacePilot Pro's).
 DEFAULT_BUTTON_COUNT = 31
-BUTTON_NAMES = {
-    0: "Menu", 1: "Fit", 2: "Top", 3: "Left", 4: "Right", 5: "Front", 6: "Bottom", 7: "Back",
-    8: "Roll ⟳", 9: "Roll ⟲", 10: "ISO 1", 11: "ISO 2",
-    **{12 + number: str(number + 1) for number in range(10)},
-    22: "Esc", 23: "Alt", 24: "Shift", 25: "Ctrl", 26: "Rotation lock", 27: "Pan/Zoom",
-    28: "Dominant", 29: "+", 30: "−",
-}
+# Group of the buttons the model does not know (raw "Button N" rows).
+OTHER_GROUP = "other"
 
 # The raw axes of the cap (spacenavd): 0 1 2 = X Y Z, 3 4 5 = RX RY RZ.
 AXIS_LABELS = ("0 · X", "1 · Y", "2 · Z", "3 · RX", "4 · RY", "5 · RZ", "6", "7")
@@ -50,8 +57,27 @@ ACTION_CHOICES = (
     ("function", "Go to a function"),
     ("select", "Select"),
     ("back", "Back"),
+    ("layer", "Switch layer"),
+    ("motion", "Cap motion"),
+    ("app", "App command"),
 )
 CHOICE_LABELS = dict(ACTION_CHOICES)
+# Modes of a layer action (SpaceMouseAction.layer_mode): (key, label, one line of explanation).
+LAYER_MODES = (
+    ("hold", "Hold", "The layer is on while this button is held; other buttons can be pressed meanwhile"),
+    ("latch", "Once", "The next press of another button uses the layer, then it ends"),
+    ("toggle", "Toggle", "The layer stays on until this button is pressed again"),
+)
+LAYER_MODE_LABELS = {key: label for key, label, _text in LAYER_MODES}
+# The cap-motion actions (SpaceMouseAction.motion): (key, label).
+MOTION_CHOICES = (
+    ("rotation", "Rotation on / off"),
+    ("translation", "Pan and zoom on / off"),
+    ("faster", "Faster"),
+    ("slower", "Slower"),
+    ("reset", "Reset"),
+)
+MOTION_LABELS = dict(MOTION_CHOICES)
 # A modifier cannot be held for a hold action: it is held while the button is down.
 PRESS_ONLY = ("Ctrl", "Shift", "Alt")
 
@@ -64,8 +90,67 @@ def supported_choices():
     )
 
 
-def button_name(index):
-    return BUTTON_NAMES.get(index, f"Button {index}")
+def model_for_device(device_name, count=DEFAULT_BUTTON_COUNT):
+    """The model the button list follows: the device's; the SpacePilot Pro (the
+    one the default map is for) while no device name is known; a generic one,
+    "Button N" per index, for a device of another make."""
+    if not str(device_name or "").strip():
+        return SPACEPILOT_PRO
+    return model_for_name(device_name) or generic_model(count)
+
+
+def button_name(index, model=SPACEPILOT_PRO):
+    """"Top view", "Function key 1 (long)"; "Button N" when the model has no such key."""
+    found = key_for_index(model, index) if model is not None else None
+    if found is None:
+        return f"Button {index}"
+    key, is_long = found
+    return (key.long_name or f"{key.name} (long)") if is_long else key.name
+
+
+@dataclass(frozen=True)
+class KeyRow:
+    """One row of the button list: a physical key (``key``) with one raw index,
+    or two when the device itself tells a short from a long press; a button the
+    model does not know has no ``key``."""
+
+    group: str
+    title: str
+    label: str
+    indexes: tuple
+    key: Key | None = None
+
+    @property
+    def dual(self):
+        return len(self.indexes) == 2
+
+
+def group_title(model, group):
+    if group == OTHER_GROUP:
+        return "Other buttons"
+    return "Buttons" if model.id == "generic" else GROUP_LABELS.get(group, group.title())
+
+
+def key_rows(model, buttons_maps=(), extra=()):
+    """The rows of the button list, grouped in the order of GROUPS: the model's
+    keys, then "Button N" rows for raw indexes outside the model that have a
+    binding in ``buttons_maps`` or are in ``extra`` (a pressed one)."""
+    rows = [
+        KeyRow(key.group, key.name, key.label, (key.index,) if key.long_index is None else (key.index, key.long_index), key)
+        for key in model.keys
+    ]
+    rows.sort(key=lambda row: GROUPS.index(row.group) if row.group in GROUPS else len(GROUPS))
+    known = {index for row in rows for index in row.indexes}
+    unknown = {int(key) for buttons in buttons_maps for key in buttons if str(key).isdigit()}
+    unknown |= {index for index in extra if isinstance(index, int)}
+    for index in sorted(unknown - known):
+        if 0 <= index < SPACEMOUSE_BUTTONS:
+            rows.append(KeyRow(OTHER_GROUP, f"Button {index}", str(index), (index,)))
+    return rows
+
+
+def row_for_index(rows, index):
+    return next((row for row in rows if index in row.indexes), None)
 
 
 def button_count(buttons_maps=(), reported=None):
@@ -87,10 +172,24 @@ def choice_of(action):
     return action.type if action.type in CHOICE_LABELS else "none"
 
 
-def new_action(choice, previous=None):
-    """The action for a dropdown choice, keeping what fits from the previous one."""
+def new_action(choice, previous=None, layers=()):
+    """The action for a dropdown choice, keeping what fits from the previous one;
+    a new layer action takes the first of ``layers`` (none yet: it has no layer)."""
     if choice == "none":
         return None
+    if choice == "layer":
+        same = previous is not None and previous.type == "layer"
+        return SpaceMouseAction(
+            "layer", layer=previous.layer if same else (layers[0] if layers else None),
+            layer_mode=(previous.layer_mode or "hold") if same else "hold",
+        )
+    if choice == "motion":
+        same = previous is not None and previous.type == "motion"
+        return SpaceMouseAction("motion", motion=previous.motion if same else "rotation")
+    if choice == "app":
+        same = previous is not None and previous.type == "app"
+        keys = list(previous.keys) if previous is not None and previous.keys and previous.type in ("macro", "key_hold", "app") else None
+        return SpaceMouseAction("app", command=previous.command if same else None, keys=keys)
     if choice in PRESS_ONLY:
         return SpaceMouseAction("modifier", modifier=choice)
     if choice in ("macro", "key_hold"):
@@ -109,12 +208,22 @@ def new_action(choice, previous=None):
 
 
 def is_valid(action):
-    """Whether the schema keeps the action: a key_hold without keys is dropped on load."""
-    return action is None or action.type != "key_hold" or bool(action.keys)
+    """Whether the schema keeps the action: a key_hold without keys, a layer
+    without a name and an app command without an id are dropped on load."""
+    if action is None:
+        return True
+    if action.type == "key_hold":
+        return bool(action.keys)
+    if action.type == "layer":
+        return bool((action.layer or "").strip())
+    if action.type == "app":
+        return bool((action.command or "").strip())
+    return True
 
 
-def describe_action(action):
-    """A short text for a row: "Ctrl+Tab", "Hold Ctrl+Tab", "Group: Modeling", "Dial"."""
+def describe_action(action, titles=None):
+    """A short text for a row: "Ctrl+Tab", "Hold Ctrl+Tab", "Group: Modeling", "Dial".
+    ``titles`` (command id -> title) names app commands the application's list knows."""
     if action is None or action.type == "none":
         return "Pass through"
     if action.type == "macro":
@@ -138,29 +247,47 @@ def describe_action(action):
         return "Select"
     if action.type == "back":
         return "Back"
+    if action.type == "layer":
+        if not action.layer:
+            return "Layer: not set"
+        mode = {"latch": "once", "toggle": "toggle"}.get(action.layer_mode or "hold", "hold")
+        return f"Layer: {action.layer} ({mode})"
+    if action.type == "motion":
+        return f"Cap: {MOTION_LABELS.get(action.motion, action.motion or 'not set').lower()}"
+    if action.type == "app":
+        if not action.command:
+            return "App command not set"
+        text = f"App: {(titles or {}).get(action.command) or action.command}"
+        return f"{text} ({keys_to_text(action.keys)})" if action.keys else text
     return action.type
 
 
-def describe_button(button):
-    """"Press: Dial · Hold: Group: Modeling"; a lone press is just its text."""
+def describe_button(button, use_label=True, titles=None):
+    """"Press: Dial · Hold: Group: Modeling"; a lone press is just its text. The
+    button's own label (the text for a device screen) replaces it."""
+    if use_label and button is not None and button.label:
+        return button.label
     if button is None or (button.press is None and button.hold is None):
         return "Pass through"
     if button.hold is None:
-        return describe_action(button.press)
-    press = describe_action(button.press)
-    return f"{press} · Hold: {describe_action(button.hold)}" if button.press else f"Hold: {describe_action(button.hold)}"
+        return describe_action(button.press, titles)
+    press = describe_action(button.press, titles)
+    hold = describe_action(button.hold, titles)
+    return f"{press} · Hold: {hold}" if button.press else f"Hold: {hold}"
 
 
 def global_buttons(config):
-    """The global map as the driver reads it (the defaults while none is stored)."""
-    return config.spacemouse.buttons or default_spacemouse_buttons()
+    """The global map as the driver reads it (the defaults while none has an action;
+    label-only entries, names for the screen, are laid over either)."""
+    return spacemouse_buttons_for(config)
 
 
 def editable_global(config):
     """The global map for editing: the defaults are stored on the first edit so
     they stay when one button changes."""
-    if not config.spacemouse.buttons:
-        config.spacemouse.buttons = copy.deepcopy(default_spacemouse_buttons())
+    stored = config.spacemouse.buttons
+    if not any(button.press is not None or button.hold is not None for button in stored.values()):
+        config.spacemouse.buttons = merge_spacemouse_buttons(copy.deepcopy(default_spacemouse_buttons()), stored)
     return config.spacemouse.buttons
 
 
@@ -168,30 +295,42 @@ def binding(config, profile, index):
     """(button, source) the driver runs for ``index`` under ``profile``: source is
     "profile", "global" or None (nothing bound)."""
     key = str(index)
-    if profile is not None and key in profile.spacemouse_buttons:
-        return profile.spacemouse_buttons[key], "profile"
     button = global_buttons(config).get(key)
+    parent = getattr(profile, "parent", None)
+    if parent is not None:
+        # A profile's context (contexts.ContextScope): what it leaves alone is the
+        # profile's binding, which in turn falls back to All applications.
+        button, _source = binding(config, parent, index)
+        if key not in profile.spacemouse_buttons:
+            return button, ("global" if button is not None else None)
+    if profile is not None and key in profile.spacemouse_buttons:
+        own = profile.spacemouse_buttons[key]
+        if own.press is None and own.hold is None and button is not None:
+            # A label only: the actions of all applications stay.
+            return SpaceMouseButton(press=button.press, hold=button.hold, label=own.label or button.label), "global"
+        return own, "profile"
     return button, ("global" if button is not None else None)
 
 
 def store(buttons, index, button):
-    """Put ``button`` (a copy) in the map; one without actions passes through:
+    """Put ``button`` (a copy, its label too) in the map; one without actions passes through:
     an explicit "none" press keeps the entry, so a profile's override survives
     and an emptied global map does not bring the defaults back."""
     key = str(index)
     if button is None:
         buttons.pop(key, None)
         return
-    if button.press is None and button.hold is None:
-        button = SpaceMouseButton(press=SpaceMouseAction("none"))
-    buttons[key] = SpaceMouseButton(press=button.press, hold=button.hold)
+    press = button.press
+    if press is None and button.hold is None:
+        press = SpaceMouseAction("none")
+    buttons[key] = SpaceMouseButton(press=press, hold=button.hold, label=button.label)
 
 
 def store_global(buttons, index, button):
     """Like store(), but a global button without actions is simply left out
     (unless that empties the map: the defaults would come back)."""
     key = str(index)
-    if button is not None and button.press is None and button.hold is None:
+    if button is not None and button.press is None and button.hold is None and not button.label:
         buttons.pop(key, None)
         if not buttons:
             buttons[key] = SpaceMouseButton(press=SpaceMouseAction("none"))

@@ -32,11 +32,21 @@ class FakeBus:
 class ScriptTextTest(unittest.TestCase):
     def test_script_calls_the_drivers_method_on_activation_and_once_at_load(self):
         text = kwin_script.script_text()
-        self.assertIn('callDBus("%s", "%s", "%s", "SetActiveApplication"' % (DBUS_NAME, DBUS_PATH, DBUS_INTERFACE), text)
+        self.assertIn('callDBus("%s", "%s", "%s", "SetActiveWindow", String(id), String(caption))' % (DBUS_NAME, DBUS_PATH, DBUS_INTERFACE), text)
         self.assertIn("workspace.windowActivated", text)
         self.assertIn("window.desktopFileName || window.resourceClass", text)
         self.assertIn("report(workspace.activeWindow", text)
         self.assertEqual(text.count("%"), 0)  # fully filled in
+
+    def test_script_sends_the_caption_and_follows_it_on_the_active_window_only(self):
+        text = kwin_script.script_text()
+        self.assertIn("window.caption", text)
+        # A change of the caption is reported for the window in focus ...
+        self.assertIn("current.captionChanged.connect(captionChanged)", text)
+        # ... and the previous window is let go before the next is followed.
+        self.assertLess(text.index("current.captionChanged.disconnect(captionChanged)"),
+                        text.index("current = window || null"))
+        self.assertIn("function captionChanged() {\n    send(current);", text)
 
     def test_kde_is_read_from_the_desktop_list(self):
         self.assertTrue(kwin_script.is_kde({"XDG_CURRENT_DESKTOP": "KDE"}))

@@ -21,6 +21,9 @@ class FakeSpacenavd:
         self.version = version  # None: an old daemon that never answers the handshake
         self.device_name = device_name
         self.sensitivity = 1.0
+        # Per axis (X Y Z RX RY RZ) sensitivities and inverted axes.
+        self.axis_sensitivity = [1.0] * 6
+        self.invert = [0] * 6
         self.evmask = 0x03
         self.button_map = {}
         self.client_name = ""
@@ -146,6 +149,16 @@ class FakeSpacenavd:
             self.respond(client, request, [proto.float_to_bits(self.sensitivity)])
         elif request == proto.REQ_SCFG_SENS:
             self.sensitivity = proto.bits_to_float(data[0])
+            self.respond(client, request)
+        elif request == proto.REQ_GCFG_SENS_AXIS:
+            self.respond(client, request, [proto.float_to_bits(value) for value in self.axis_sensitivity])
+        elif request == proto.REQ_SCFG_SENS_AXIS:
+            self.axis_sensitivity = [proto.bits_to_float(bits) for bits in data[:6]]
+            self.respond(client, request)
+        elif request == proto.REQ_GCFG_INVERT:
+            self.respond(client, request, list(self.invert))
+        elif request == proto.REQ_SCFG_INVERT:
+            self.invert = [1 if value else 0 for value in data[:6]]
             self.respond(client, request)
         elif request == proto.REQ_GCFG_BNMAP:
             self.respond(client, request, [data[0], self.button_map.get(data[0], data[0])])

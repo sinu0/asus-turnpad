@@ -62,8 +62,11 @@ with the dial switched off, and gives the pointer back when it stops.
 ## Mouse-only mode: computers without a touchpad
 
 On a desktop PC a mouse can be the dial: open *Turnpad → Driver* and switch
-on **Mouse-only mode**; the app restarts the driver (it then needs no
-touchpad). While the dial is on, the driver grabs the mouse: the pointer and
+on **Mouse-only mode** (the first-run assistant, or Driver → *Set up…*, does
+this for you when it finds a mouse); the app restarts the driver (it then needs
+no touchpad). Pick the mouse in the *Mouse* list and press *Press the key…* to
+set the toggle key by pressing the mouse button; the typed key name is the
+advanced way. While the dial is on, the driver grabs the mouse: the pointer and
 the clicks stand still and the wheel does not scroll the window.
 
 - **Switching on and off:** a key the mouse sends. Map a side button of the
@@ -104,6 +107,9 @@ mode is switched on as well, Mouse-only mode wins.
 
 ## SpaceMouse mode: a 3Dconnexion SpaceMouse
 
+This is the short reference; [SPACEMOUSE.md](SPACEMOUSE.md) is the full guide
+(setup, buttons, layers, cap motion, the screen, Blender).
+
 A SpaceMouse (tested: SpacePilot Pro) can drive the dial on a computer without
 a touchpad, alone or together with Mouse-only mode. It needs `spacenavd` (the
 free driver for these devices; AUR `spacenavd` on Arch, packages of the same
@@ -112,8 +118,8 @@ is one more client of it, speaking its socket protocol; no library is needed.
 Enable it on the *SpaceMouse* page of the settings app (a switch, the device
 status, the buttons with their press and hold actions, per-application
 overrides, and the cap's axes) or in `~/.config/asus-turnpad/config.json`
-(`"spacemouse": {"enabled": true}`), then restart the driver. With a touchpad mode on the computer (a DialPad, or Touchpad
-mode) SpaceMouse mode is not supported yet and is ignored with a warning. The
+(`"spacemouse": {"enabled": true}`), then restart the driver. With a touchpad
+mode on the computer (a DialPad, or Touchpad mode) SpaceMouse mode is not supported yet and is ignored with a warning. The
 driver takes any touchpad named like an ASUS one (`ASUE`, `ELAN`, `ASUP`,
 `ASUF`, `ASCE`, `ASCF`, `ASCP` with `Touchpad`) for a DialPad, so on such a
 laptop (an ELAN touchpad included) SpaceMouse mode is ignored too, even if the
@@ -121,9 +127,14 @@ touchpad has no printed dial; that limit goes away when the modes can be
 combined.
 
 - **Buttons:** each button (numbered as the device reports them: 0 = Menu,
-  17..21 = function keys 1..5, 22 = Esc, 23/24/25 = Alt/Shift/Ctrl on a
-  SpacePilot Pro) has a *press* action and a *hold* action (after `hold_ms`,
-  400). A button with only a press action acts at once. Actions: `macro`
+  12..16 = function keys 1..5 pressed briefly, 17..21 = the same keys held
+  for about a second, 22 = Esc, 23/24/25 = Alt/Shift/Ctrl on a SpacePilot Pro;
+  the settings page lists the physical keys) has a *press* action and a *hold*
+  action (after `hold_ms`, 400). The function keys, T, R, F, Roll and ISO
+  decide short and long press themselves (the device sends another button
+  number for the long press): bind each number a press action, there is no
+  hold on them. A button can have a `label`, the text a device screen shows.
+  A button with only a press action acts at once. Actions: `macro`
   (keys or steps), `modifier` (Ctrl/Shift/Alt held while the button is
   down), `dial` (switch the dial on or off), `group` (open a group's list of
   the current profile), `function` (enter a function by name or menu place),
@@ -131,9 +142,14 @@ combined.
   as the press or, after `hold_ms`, as the hold action: hold `Z` to open a
   Blender pie menu and let go to choose) and `none` (leave the button to the
   application; in a profile it overrides the global binding, e.g. `Esc` and
-  `Ctrl` in Blender). Without a configured map the SpacePilot Pro default is
+  `Ctrl` in Blender), `layer` (switch to another set of buttons, below),
+  `motion` (change how the cap moves a 3D program, below) and `app` (run a
+  command of the focused application through the app link, with `keys` as the
+  fallback). Without a configured map the SpacePilot Pro default is
   used: Menu opens the dial, the function keys enter the first five functions
-  (held: open the first group), Esc goes back, Alt/Shift/Ctrl are held. A
+  (held for a second: the next five), Esc goes back, Alt/Shift/Ctrl are held,
+  Rotation and Pan/Zoom switch those motions of the cap off and on, + and −
+  make it faster and slower. A
   profile can bind buttons itself (`spacemouse_buttons`), which replaces the
   global binding of that button; a profile with no functions but buttons keeps
   the default profile's dial menu and applies its buttons. Other buttons are
@@ -157,14 +173,40 @@ combined.
   for other programs until the cap moves again, so switch the dial on with the
   cap at rest. The old value is also saved in
   `~/.config/asus-turnpad/spacenav-restore.json` and restored at the next
-  start if the driver was killed. `hide_buttons` (off, experimental) can
-  additionally hide the buttons Turnpad binds in the focused application's
-  profile from other programs (not the ones set to `none`, which pass
-  through); it follows the focus and gives the buttons back when you switch
+  start if the driver was killed. Another program can do the same for a while
+  with the D-Bus command `Control` `mute:MS` (at most 5 s, renewed by the
+  sender; it works with `mute_others` off too). `hide_buttons` (off by
+  default) can additionally hide the buttons Turnpad binds (in the focused
+  application's profile and the global map, and in their layers) from other
+  programs (not the ones set to `none`, which pass through); it follows the focus and gives the buttons back when you switch
   (a button that is held down at that moment changes when it is let go).
   Blender 5.2 itself binds the Menu button (its 3D-mouse panel), Fit, the view
   axes, Roll and +/−, and leaves ISO, 1–12 and V1–V3 unbound, so turn this on
   when Menu is the dial.
+- **Button layers:** a `layer` action (`layer` = name, `layer_mode`) switches
+  the buttons to another map laid over the base map; buttons the layer does not
+  bind keep their base binding. Modes: `hold` (while the button is down),
+  `latch` (the next press of any other button uses the layer, then it ends)
+  and `toggle` (until the button is pressed again). Layers are global
+  (`spacemouse.layers`) and per profile (`spacemouse_layers`). Hold layers
+  cannot be run with `Control` `button:INDEX`.
+- **Cap motion per application:** `spacemouse.motion` and a profile's
+  `spacemouse_motion` change how the cap moves the 3D program: `sensitivity`
+  (0.1–4), `axis_sensitivity` (six values, 0 locks an axis), `invert`
+  (six flags), `rotation` and `translation` (off = that group is silent).
+  They are factors on spacenavd's own settings, applied while the application
+  has focus and given back afterwards (also at the next start from the restore
+  file after a crash); the default sends nothing. The buttons Rotation,
+  Pan/Zoom, + and − (`motion` actions) change them for the running session
+  only.
+- **App commands and the Blender add-on:** an application with an add-on
+  (Blender) tells the driver its commands through a private socket; the `app`
+  action runs one of them (and the screen can show them). Install the add-on
+  from the *Blender* group of the SpaceMouse page. Profile contexts can switch
+  menus and buttons by the application's mode.
+- **Screen:** a SpacePilot Pro's screen is drawn by its own service,
+  `asus-turnpad-screen.service` (needs `pyusb`); see the *Screen* page of the
+  settings app and [SPACEMOUSE.md](SPACEMOUSE.md).
 - **Settings:** `socket` (empty: `$SPNAV_SOCKET`, `/etc/spnavrc`, the runtime
   directory, `/var/run/spnav.sock`), `axis_max` (400), `tilt_axes`
   (`[horizontal, vertical]`, default `[5, 3]`, with `tilt_invert`),

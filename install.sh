@@ -55,6 +55,8 @@ set -o pipefail
     if [ "$XDG_SESSION_TYPE" == "wayland" ]; then
         OPTIONAL_PACKAGES="$OPTIONAL_PACKAGES $(packages wayland)"
     fi
+    # pyusb for the screen of a SpacePilot Pro (install_screen.sh)
+    OPTIONAL_PACKAGES="$OPTIONAL_PACKAGES $(packages screen)"
     if [[ "$DESKTOP_SESSION" == plasma* ]]; then
         REQUIRED_PACKAGES="$REQUIRED_PACKAGES $(packages plasma)"
     fi
@@ -130,17 +132,20 @@ set -o pipefail
     # The program now runs with the system Python.
     remove_legacy_venv
 
-    sudo mkdir -p "$INSTALL_DIR_PATH/layouts" "$INSTALL_DIR_PATH/config" "$INSTALL_DIR_PATH/config_app" "$INSTALL_DIR_PATH/desktop" "$INSTALL_DIR_PATH/overlay" "$INSTALL_DIR_PATH/gnome/extension"
+    sudo mkdir -p "$INSTALL_DIR_PATH/layouts" "$INSTALL_DIR_PATH/config" "$INSTALL_DIR_PATH/config_app" "$INSTALL_DIR_PATH/desktop" "$INSTALL_DIR_PATH/overlay" "$INSTALL_DIR_PATH/screen" "$INSTALL_DIR_PATH/integrations/blender/turnpad" "$INSTALL_DIR_PATH/gnome/extension"
     sudo install dialpad.py "$INSTALL_DIR_PATH"
     sudo install dialpad_dbus.py "$INSTALL_DIR_PATH"
     sudo install dial_gesture.py "$INSTALL_DIR_PATH"
-    sudo install -m 644 backlight.py dir_watch.py launch.py layout_detect.py mouse_dial.py spacemouse_dial.py spacenav_client.py xkb.py laptop_touchpad_dialpad_layouts.csv "$INSTALL_DIR_PATH"
+    sudo install -m 644 app_link.py app_suggest.py backlight.py dir_watch.py launch.py layout_detect.py mouse_dial.py spacemouse_dial.py spacemouse_devices.py spacenav_client.py xkb.py laptop_touchpad_dialpad_layouts.csv "$INSTALL_DIR_PATH"
     sudo install -t "$INSTALL_DIR_PATH/layouts" layouts/*.py
     sudo install -m 644 -t "$INSTALL_DIR_PATH/config" config/*.py
     sudo install -m 644 -t "$INSTALL_DIR_PATH/desktop" desktop/*.py
     sudo install -m 644 -t "$INSTALL_DIR_PATH/overlay" overlay/*.py
+    sudo install -m 644 -t "$INSTALL_DIR_PATH/screen" screen/*.py
+    # The Blender add-on (the settings app builds its zip from here).
+    sudo install -m 644 -t "$INSTALL_DIR_PATH/integrations/blender/turnpad" integrations/blender/turnpad/*.py integrations/blender/turnpad/*.toml
     sudo install -m 755 config_app/main.py "$INSTALL_DIR_PATH/config_app/main.py"
-    sudo install -m 644 config_app/__init__.py config_app/outline_editor.py config_app/spacemouse.py config_app/icon.svg config_app/style.css "config_app/$APP_ID.desktop" "$INSTALL_DIR_PATH/config_app/"
+    sudo install -m 644 config_app/__init__.py config_app/blender_addon.py config_app/commandline.py config_app/context_dialogs.py config_app/contexts.py config_app/device_dialogs.py config_app/hardware.py config_app/key_capture.py config_app/outline_editor.py config_app/recorder.py config_app/recorder_dialog.py config_app/screen_page.py config_app/spacemouse.py config_app/spacemouse_extra.py config_app/spacemouse_ui.py config_app/icon.svg config_app/style.css "config_app/$APP_ID.desktop" "$INSTALL_DIR_PATH/config_app/"
     sudo install -m 644 gnome/extension/extension.js gnome/extension/dial.js gnome/extension/layers.js gnome/extension/skins.json gnome/extension/metadata.json gnome/extension/stylesheet.css "$INSTALL_DIR_PATH/gnome/extension/"
 
     mkdir -p "$(dirname "$LAUNCHER_PATH")" "$(dirname "$ICON_PATH")"
@@ -219,6 +224,10 @@ set -o pipefail
     echo
 
     source install_overlay.sh
+
+    echo
+
+    source install_screen.sh
 
     echo
 

@@ -2,9 +2,10 @@
 
 Plasma 6 has no D-Bus call that answers "which window is active"
 (``org.kde.KWin.activeWindow`` is gone), so the driver loads a tiny KWin
-script that reports every activation to the driver's own D-Bus method
-``SetActiveApplication`` (the same call the GNOME Shell extension makes), and
-once when it is loaded. The polling backends in ``active_window.py`` stay as
+script that reports every activation, with the window's title (and each change of
+that title), to the driver's own D-Bus method ``SetActiveWindow``, and once when
+it is loaded. ``SetActiveApplication`` (the application only) stays for the GNOME
+Shell extension and older scripts. The polling backends in ``active_window.py`` stay as
 the fallback.
 
 The pure parts (the script text, the call sequence over a ``bus`` with a
@@ -26,13 +27,33 @@ KWIN = "org.kde.KWin"
 SCRIPTING_PATH = "/Scripting"
 SCRIPTING_INTERFACE = "org.kde.kwin.Scripting"
 
-SCRIPT = """// Written by Turnpad: reports the active window's application to the driver.
-function report(window) {
+SCRIPT = """// Written by Turnpad: reports the active window's application and title to the driver.
+var current = null;
+function send(window) {
     var id = "";
+    var caption = "";
     if (window) {
         id = window.desktopFileName || window.resourceClass || "";
+        caption = window.caption || "";
     }
-    callDBus(%(name)s, %(path)s, %(interface)s, "SetActiveApplication", String(id));
+    callDBus(%(name)s, %(path)s, %(interface)s, "SetActiveWindow", String(id), String(caption));
+}
+function captionChanged() {
+    send(current);
+}
+function report(window) {
+    // The title of the window that has the focus now is the one to follow.
+    if (current && current.captionChanged) {
+        try {
+            current.captionChanged.disconnect(captionChanged);
+        } catch (error) {
+        }
+    }
+    current = window || null;
+    if (current && current.captionChanged) {
+        current.captionChanged.connect(captionChanged);
+    }
+    send(current);
 }
 // Plasma 6 names; Plasma 5 had clientActivated and activeClient.
 var activated = workspace.windowActivated || workspace.clientActivated;

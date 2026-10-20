@@ -36,12 +36,15 @@ DBUS_DAEMON = shutil.which("dbus-daemon")
 # signal from the main thread before the service starts; GetStatus reports
 # the thread that received it.
 SERVICE = r"""
+import json
 import sys
 import threading
 from gi.repository import Gio
 from dialpad_dbus import DialPadDBusService
 
 active = []
+controls = []
+windows = []
 received = {}
 
 def on_ping(*_args):
@@ -64,6 +67,10 @@ def reload_config():
     })
     service.emit_overlay_state({"details": {"pointer": 42.5}})
     service.emit_calibration_progress({"step": "outer", "point": [1, 2]})
+    # The same state twice sends one signal, a change sends another.
+    service.emit_driver_state({"profile": "Krita", "dial": True})
+    service.emit_driver_state({"dial": True, "profile": "Krita"})
+    service.emit_driver_state({"profile": "Krita", "dial": False})
     return True
 
 service = DialPadDBusService(
@@ -73,9 +80,14 @@ service = DialPadDBusService(
     status_provider=lambda: {
         "enabled": True, "application": active[-1] if active else "",
         "touchpad_max_x": 4010, "huge": 2**70, "ratio": 0.5, "nan": float("nan"), "none": None,
+        "controls": "|".join(controls),
+        "windows": "|".join(windows),
         **received,
     },
     on_cancel_calibration=lambda: False,
+    on_control=lambda command: controls.append(command) or command != "bad",
+    on_active_window=lambda app, title: windows.append(app + "/" + title),
+    on_app_commands=lambda app: json.dumps({"app": app, "connected": False, "commands": []}),
 )
 print("ready" if service.start() else "failed", flush=True)
 sys.stdin.read()
@@ -140,7 +152,7 @@ class DBusServiceTest(unittest.TestCase):
         def on_signal(_connection, _sender, _path, _interface, name, parameters):
             self.signals.append((name, parameters.unpack()))
 
-        for name in ("OverlayState", "OverlayDetails", "CalibrationProgress"):
+        for name in ("OverlayState", "OverlayDetails", "CalibrationProgress", "DriverState"):
             self.connection.signal_subscribe(
                 sender, DBUS_INTERFACE, name, DBUS_PATH, None,
                 Gio.DBusSignalFlags.NONE, on_signal,
@@ -183,6 +195,7 @@ class DBusServiceTest(unittest.TestCase):
         }
         self.assertEqual(types, {
             "enabled": "b", "application": "s", "touchpad_max_x": "x", "huge": "x", "ratio": "d",
+            "controls": "s", "windows": "s",
         })
         self.assertEqual(reply.unpack()[0]["application"], "firefox")
         self.assertEqual(reply.unpack()[0]["huge"], 2**63 - 1)
@@ -190,14 +203,43 @@ class DBusServiceTest(unittest.TestCase):
         with self.assertRaises(GLib.Error):
             self.call(proxy, "SetActiveApplication", GLib.Variant("(i)", (5,)))
 
+        # SetActiveWindow hands the application and the title over; GetAppCommands answers JSON.
+        self.assertEqual(self.call(proxy, "SetActiveWindow", GLib.Variant("(ss)", ("blender", "Cube - Blender"))), ())
+        self.assertEqual(self.call(proxy, "GetStatus")[0]["windows"], "blender/Cube - Blender")
+        self.assertEqual(
+            json.loads(self.call(proxy, "GetAppCommands", GLib.Variant("(s)", ("blender",)))[0]),
+            {"app": "blender", "connected": False, "commands": []},
+        )
+        with self.assertRaises(GLib.Error):
+            self.call(proxy, "SetActiveWindow", GLib.Variant("(s)", ("blender",)))
+
+        # Control hands the text to the driver and returns its answer.
+        self.assertEqual(self.call(proxy, "Control", GLib.Variant("(s)", ("rotate:2",))), (True,))
+        self.assertEqual(self.call(proxy, "Control", GLib.Variant("(s)", ("bad",))), (False,))
+        with self.assertRaises(GLib.Error):
+            self.call(proxy, "Control", GLib.Variant("(i)", (1,)))
+        self.assertEqual(self.call(proxy, "GetStatus")[0]["controls"], "rotate:2|bad")
+
+        # Before the first publish the state is the empty one.
+        empty = json.loads(self.call(proxy, "GetDriverState")[0])
+        self.assertEqual((empty["dial"], empty["profile"], empty["modifiers"]), (False, "", []))
+
         self.assertEqual(self.call(proxy, "ReloadConfig"), (True,))
         self.assertTrue(self.pump(lambda: any(name == "CalibrationProgress" for name, _ in self.signals)))
         self.pump(lambda: False, 0.2)
 
-        # Details before the state, details-only sends no OverlayState.
+        # Details before the state, details-only sends no OverlayState, an
+        # unchanged driver state sends no second DriverState.
         self.assertEqual([name for name, _ in self.signals], [
             "OverlayDetails", "OverlayState", "OverlayDetails", "CalibrationProgress",
+            "DriverState", "DriverState",
         ])
+        self.assertEqual(
+            [json.loads(arguments[0])["dial"] for name, arguments in self.signals if name == "DriverState"],
+            [True, False],
+        )
+        latest = json.loads(self.call(proxy, "GetDriverState")[0])
+        self.assertEqual((latest["profile"], latest["dial"]), ("Krita", False))
         first = json.loads(self.signals[0][1][0])
         self.assertEqual((first["profile"], first["colors"]), ("Krita", ["#fff"]))
         self.assertEqual(self.signals[1][1], (

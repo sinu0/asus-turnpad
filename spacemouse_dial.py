@@ -14,7 +14,8 @@ from collections import namedtuple
 from dial_gesture import touch_angle
 
 # kind: "action" (run `action`), "hold_down" / "hold_up" (hold or
-# release the keys of `action`: a modifier or key_hold), "select" (a centre tap on the highlighted
+# release the keys of `action`: a modifier or key_hold), "layer_down" /
+# "layer_up" (a hold layer is active while its button is down), "select" (a centre tap on the highlighted
 # entry), "close" (switch the dial off).
 ButtonAction = namedtuple("ButtonAction", "kind index action")
 
@@ -22,6 +23,17 @@ ButtonAction = namedtuple("ButtonAction", "kind index action")
 OPENING_TYPES = ("dial", "group")
 # Actions that keep keys down while the button is down.
 HOLDING_TYPES = ("modifier", "key_hold")
+# Actions that are no gesture on the dial: they do not end a menu waiting for its opener.
+SIDE_TYPES = HOLDING_TYPES + ("layer", "motion")
+
+
+def _holds(action):
+    """Whether the action stays in force while the button is down: keys held, or a hold layer."""
+    return action.type in HOLDING_TYPES or (action.type == "layer" and action.layer_mode in (None, "hold"))
+
+
+def _hold_kinds(action):
+    return ("layer_down", "layer_up") if action.type == "layer" else ("hold_down", "hold_up")
 
 
 def _real(action):
@@ -85,7 +97,7 @@ class ButtonMachine:
     def release_all(self):
         """The connection is gone: let go of held keys, forget everything."""
         out = [
-            ButtonAction("hold_up", index, state.holding)
+            ButtonAction(_hold_kinds(state.holding)[1], index, state.holding)
             for index, state in self.down.items() if state.holding is not None
         ]
         self.down.clear()
@@ -118,15 +130,15 @@ class ButtonMachine:
         # keeps keys down (Ctrl while the menu button is held) or that is left to
         # other programs must not.
         if press is not None:
-            gesture = press.type not in HOLDING_TYPES
+            gesture = press.type not in SIDE_TYPES
         else:
-            gesture = hold is not None and hold.type not in HOLDING_TYPES
+            gesture = hold is not None and hold.type not in SIDE_TYPES
         if gesture:
             self.clear_opener()
 
-        if press is not None and press.type in HOLDING_TYPES:
+        if press is not None and _holds(press):
             state.holding = press
-            return [ButtonAction("hold_down", index, press)]
+            return [ButtonAction(_hold_kinds(press)[0], index, press)]
         if press is not None and hold is None:
             out = [ButtonAction("action", index, press)]
             self._opened(index, press, dial_on)
@@ -142,9 +154,9 @@ class ButtonMachine:
                 continue
             if now - state.start >= self.hold_time:
                 state.hold_fired = True
-                if hold.type in HOLDING_TYPES:
+                if _holds(hold):
                     state.holding = hold
-                    out.append(ButtonAction("hold_down", index, hold))
+                    out.append(ButtonAction(_hold_kinds(hold)[0], index, hold))
                 else:
                     out.append(ButtonAction("action", index, hold))
                     self._opened(index, hold, dial_on)
@@ -157,7 +169,7 @@ class ButtonMachine:
         out = []
         press, hold = state.press, state.hold
         if state.holding is not None:
-            return [ButtonAction("hold_up", index, state.holding)]
+            return [ButtonAction(_hold_kinds(state.holding)[1], index, state.holding)]
         if hold is not None and not state.hold_fired and press is not None:
             out.append(ButtonAction("action", index, press))
             self._opened(index, press, dial_on)
@@ -334,3 +346,164 @@ class ListStepper:
             self.next_time = now + self.interval(fraction)
             return direction
         return 0
+
+
+class MuteLease:
+    """A program asks the driver (Control ``mute:MS``) to silence the other
+    spacenavd clients for a while, e.g. a game on the device's screen. The lease
+    runs out by itself, so a program that crashed lets go within MAX_MS; the
+    driver renews nothing. ``now`` is any clock that only moves forward."""
+
+    MAX_MS = 5000
+
+    def __init__(self):
+        self.until = 0.0
+
+    def grant(self, ms, now):
+        """Hold the mute for ``ms`` milliseconds from ``now``; 0 ends the lease."""
+        ms = max(0, min(self.MAX_MS, int(ms)))
+        self.until = now + ms / 1000 if ms else 0.0
+
+    def active(self, now):
+        # A clock that jumped back would make a long lease: never longer than MAX_MS ahead.
+        return now < self.until <= now + self.MAX_MS / 1000
+
+    def wanted(self, dial_on, mute_others, now):
+        """Whether the other clients must be silent: the dial is on (and the
+        configuration says to mute) or a lease runs."""
+        return bool(dial_on and mute_others) or self.active(now)
+
+
+class LayerState:
+    """The active button layer.
+
+    A layer button's action activates a layer in one of three ways: ``hold``
+    (while its button is down: ``hold_down``/``hold_up``), ``latch`` (the next
+    press of any other button uses it, then it ends; pressing the layer
+    button again cancels) and ``toggle`` (until the layer button is pressed
+    again). The most recently activated one is the active layer; when it ends
+    the one before it is active again. ``preempt()`` first: a press of the
+    button that owns a latch or toggle only ends it and does nothing else.
+    ``clear_sticky()`` ends latches and toggles (the profile changed or the
+    connection is gone); a hold ends with its button.
+    """
+
+    def __init__(self):
+        self.entries = []  # [mode, layer name, owner button index]
+
+    @property
+    def active(self):
+        """The active layer's name, "" = the base map."""
+        try:
+            return self.entries[-1][1]
+        except IndexError:
+            return ""
+
+    def hold_down(self, index, name):
+        self.entries = [e for e in self.entries if not (e[0] == "hold" and e[2] == index)]
+        self.entries.append(["hold", name, index])
+
+    def hold_up(self, index):
+        self.entries = [e for e in self.entries if not (e[0] == "hold" and e[2] == index)]
+
+    def preempt(self, index):
+        """The button owns a latch or toggle: end it. True = the press is used up."""
+        kept = [e for e in self.entries if e[0] == "hold" or e[2] != index]
+        ended = len(kept) != len(self.entries)
+        self.entries = kept
+        return ended
+
+    def consume(self):
+        """Another button was pressed: a latch has been used."""
+        self.entries = [e for e in self.entries if e[0] != "latch"]
+
+    def activate(self, index, name, mode):
+        """A latch or toggle action ran for the button ``index``. False when the
+        same layer was active in that mode and this switched it off."""
+        same = [e for e in self.entries if e[0] == mode and e[1] == name]
+        # One latch and one toggle at a time: a new one replaces the old.
+        self.entries = [e for e in self.entries if e[0] != mode]
+        if same:
+            return False
+        self.entries.append([mode, name, index])
+        return True
+
+    def clear_sticky(self):
+        self.entries = [e for e in self.entries if e[0] == "hold"]
+
+    def clear(self):
+        self.entries = []
+
+
+# The steps of "faster" and "slower".
+SPEED_STEPS = (0.1, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0)
+
+
+class MotionSession:
+    """What the motion buttons changed for one application, not saved: the
+    cap's sensitivity and whether rotation and translation reach other
+    programs. ``base`` everywhere is the configured motion (config.schema
+    ``effective_motion()``)."""
+
+    def __init__(self):
+        self.sensitivity = None
+        self.rotation = None
+        self.translation = None
+
+    def apply(self, base):
+        """``base`` with the session's changes laid over (a new dict)."""
+        result = dict(base)
+        if self.sensitivity is not None:
+            result["sensitivity"] = self.sensitivity
+        if self.rotation is not None:
+            result["rotation"] = self.rotation
+        if self.translation is not None:
+            result["translation"] = self.translation
+        return result
+
+    @property
+    def changed(self):
+        return any(value is not None for value in (self.sensitivity, self.rotation, self.translation))
+
+    def act(self, name, base):
+        """Run a motion action; True when something changed."""
+        current = self.apply(base)
+        before = (self.sensitivity, self.rotation, self.translation)
+        if name == "rotation":
+            self.rotation = not current["rotation"]
+        elif name == "translation":
+            self.translation = not current["translation"]
+        elif name in ("faster", "slower"):
+            value = current["sensitivity"]
+            if name == "faster":
+                bigger = [step for step in SPEED_STEPS if step > value + 1e-6]
+                self.sensitivity = bigger[0] if bigger else SPEED_STEPS[-1]
+            else:
+                smaller = [step for step in SPEED_STEPS if step < value - 1e-6]
+                self.sensitivity = smaller[-1] if smaller else SPEED_STEPS[0]
+        elif name == "reset":
+            self.sensitivity = self.rotation = self.translation = None
+        return before != (self.sensitivity, self.rotation, self.translation)
+
+
+def motion_neutral(motion):
+    """The motion leaves spacenavd as it is."""
+    return (
+        abs(motion["sensitivity"] - 1.0) < 1e-6
+        and all(abs(value - 1.0) < 1e-6 for value in motion["axis_sensitivity"])
+        and not any(motion["invert"])
+        and motion["rotation"] and motion["translation"]
+    )
+
+
+def motion_values(original, motion):
+    """What to set in spacenavd: ``(sensitivity, six axis sensitivities, six invert
+    flags)`` from its ``original`` values (a dict with ``sens``, ``axis`` and
+    ``invert``) and the wanted ``motion``. The sensitivities multiply the
+    original ones, a disabled group of axes is 0, invert flips the original."""
+    axis = []
+    for position, (base, factor) in enumerate(zip(original["axis"], motion["axis_sensitivity"])):
+        on = motion["translation"] if position < 3 else motion["rotation"]
+        axis.append(base * factor if on else 0.0)
+    invert = [bool(base) != bool(flip) for base, flip in zip(original["invert"], motion["invert"])]
+    return original["sens"] * motion["sensitivity"], axis, invert

@@ -29,6 +29,8 @@ from config.schema import (
     _default_config,
 )
 
+from spacemouse_devices import GROUPS, SPACEPILOT_PRO
+
 if gi is not None:
     from config_app import spacemouse as sm
     from fake_spacenavd import FakeSpacenavd
@@ -39,11 +41,37 @@ if gi is not None:
 class DescribeTests(unittest.TestCase):
     def test_names(self):
         self.assertEqual(sm.button_name(0), "Menu")
-        self.assertEqual(sm.button_name(12), "1")
-        self.assertEqual(sm.button_name(21), "10")
-        self.assertEqual(sm.button_name(30), "−")
+        self.assertEqual(sm.button_name(12), "Function key 1")
+        self.assertEqual(sm.button_name(21), "Function key 5 (long)")
+        self.assertEqual(sm.button_name(2), "Top view")
+        self.assertEqual(sm.button_name(6), "Bottom view")
+        self.assertEqual(sm.button_name(30), "Speed −")
         self.assertEqual(sm.button_name(40), "Button 40")
-        self.assertEqual(set(sm.BUTTON_NAMES), set(range(31)))
+        self.assertEqual(sm.button_name(3, None), "Button 3")
+
+    def test_model_follows_the_device_name(self):
+        self.assertIs(sm.model_for_device(""), SPACEPILOT_PRO)  # no device known: the default map's
+        self.assertIs(sm.model_for_device("3Dconnexion SpacePilot PRO"), SPACEPILOT_PRO)
+        generic = sm.model_for_device("3Dconnexion SpaceNavigator", 15)
+        self.assertEqual((generic.id, generic.button_count), ("generic", 15))
+
+    def test_key_rows_group_the_physical_keys(self):
+        rows = sm.key_rows(SPACEPILOT_PRO)
+        self.assertEqual(len(rows), 21)
+        self.assertEqual(len({index for row in rows for index in row.indexes}), 31)
+        self.assertEqual([row.group for row in rows], sorted((row.group for row in rows), key=GROUPS.index))
+        first = rows[0]
+        self.assertEqual((first.group, first.title, first.indexes, first.dual), ("function", "Function key 1", (12, 17), True))
+        self.assertEqual(sm.row_for_index(rows, 6).title, "Top view")
+        self.assertFalse(sm.row_for_index(rows, 0).dual)
+        self.assertIsNone(sm.row_for_index(rows, 40))
+
+    def test_unknown_buttons_get_raw_rows(self):
+        rows = sm.key_rows(SPACEPILOT_PRO, [{"40": SpaceMouseButton(press=SpaceMouseAction("dial")), "x": None}], {41})
+        self.assertEqual([(row.group, row.title) for row in rows[-2:]], [("other", "Button 40"), ("other", "Button 41")])
+        self.assertEqual(len(sm.key_rows(sm.model_for_device("Other mouse", 4))), 4)
+        self.assertEqual(sm.group_title(SPACEPILOT_PRO, "view"), "View keys")
+        self.assertEqual(sm.group_title(sm.model_for_device("Other mouse", 4), "system"), "Buttons")
 
     def test_actions_in_words(self):
         describe = sm.describe_action
@@ -68,6 +96,12 @@ class DescribeTests(unittest.TestCase):
         self.assertEqual(sm.describe_button(button), "Select · Hold: Group: Edit")
         self.assertEqual(sm.describe_button(SpaceMouseButton(hold=SpaceMouseAction("back"))), "Hold: Back")
         self.assertEqual(sm.describe_button(None), "Pass through")
+
+    def test_the_label_replaces_the_description(self):
+        button = SpaceMouseButton(press=SpaceMouseAction("select"), label="Pick")
+        self.assertEqual(sm.describe_button(button), "Pick")
+        self.assertEqual(sm.describe_button(button, use_label=False), "Select")
+        self.assertEqual(sm.describe_button(SpaceMouseButton(label="Front")), "Front")
 
     def test_every_default_has_a_choice(self):
         choices = {key for key, _label in sm.ACTION_CHOICES}
@@ -120,6 +154,16 @@ class MapTests(unittest.TestCase):
         self.assertEqual((button.press.type, button.hold, source), ("back", None, "profile"))
         self.assertEqual(sm.binding(self.config, self.profile, 5), (None, None))
         self.assertEqual(sm.binding(self.config, None, 0)[1], "global")
+
+    def test_the_label_is_stored_with_the_button(self):
+        buttons = sm.editable_global(self.config)
+        sm.store_global(buttons, 12, SpaceMouseButton(press=SpaceMouseAction("select"), label="Pick"))
+        self.assertEqual(self.config.spacemouse.buttons["12"].label, "Pick")
+        sm.store(self.profile.spacemouse_buttons, 12, SpaceMouseButton(label="Only a label"))
+        stored = self.profile.spacemouse_buttons["12"]
+        self.assertEqual((stored.press.type, stored.label), ("none", "Only a label"))
+        sm.store_global(buttons, 12, SpaceMouseButton())
+        self.assertNotIn("12", self.config.spacemouse.buttons)
 
     def test_a_button_without_actions_passes_through(self):
         sm.store(self.profile.spacemouse_buttons, 0, SpaceMouseButton())

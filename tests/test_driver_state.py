@@ -7,13 +7,18 @@ extracted from its syntax tree and executed against recorded side effects.
 import ast
 import dataclasses
 import os
+import json
 import sys
+import threading
+import time
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-from config.legacy_adapter import META_KEY, shortcuts_from_config  # noqa: E402
+import app_link  # noqa: E402
+import launch  # noqa: E402
+from config.legacy_adapter import META_KEY, shortcuts_for_context, shortcuts_from_config  # noqa: E402
 from config.presets import brightness, mute, tracks, vertical_scroll, volume, zoom_wheel  # noqa: E402
 from config.schema import DialPadConfig, Profile, Segment  # noqa: E402
 
@@ -56,6 +61,15 @@ STATE_FUNCTIONS = {
     "spacemouse_binding",
     "run_spacemouse_action",
     "spacemouse_effective_buttons",
+    "spacemouse_layer_maps",
+    "spacemouse_bound_buttons",
+    "spacemouse_source",
+    "control_button_action",
+    "apply_control",
+    "on_dbus_control",
+    "driver_state",
+    "publish_driver_state",
+    "process_pending_driver_updates",
     "spacemouse_action_keys",
     "turn_selected_function",
     "rotate_dial",
@@ -64,7 +78,22 @@ STATE_FUNCTIONS = {
     "is_multifunction",
     "pad_to_minimum",
     "window_was_changed",
+    "select_profile_context",
+    "function_memory_key",
+    "app_notice_state",
+    "set_app_notice",
+    "suggest_profile",
+    "on_dbus_active_window",
+    "on_dbus_active_application",
+    "on_dbus_app_commands",
+    "on_app_link_change",
+    "on_app_link_result",
+    "run_app_command",
+    "send_profile_offer",
+    "open_add_profile",
     "get_appropriate_app_name_and_shortcuts",
+    "profile_matches_window",
+    "profile_exists_for_window",
     "overlay_enabled",
 }
 
@@ -84,6 +113,28 @@ def load_driver_state(shortcuts):
         "app_shortcuts": shortcuts,
         "app_specific_shortcuts": {},
         "app_name": None,
+        "context_name": "",
+        "SENT": app_link.SENT,
+        "NO_CLIENT": app_link.NO_CLIENT,
+        "UNKNOWN_COMMAND": app_link.UNKNOWN_COMMAND,
+        "BUSY": app_link.BUSY,
+        "APP_ID": "io.github.sinu0.AsusTurnpad",
+        "__file__": os.path.join(ROOT, "dialpad.py"),
+        "launch": launch,
+        "json": json,
+        "os": os,
+        "sys": sys,
+        "threading": threading,
+        "pushed_window_title": None,
+        "app_link": None,
+        "app_notice": {"id": 0, "text": "", "until": 0.0},
+        "APP_NOTICE_SECONDS": 6,
+        "SUGGESTION_SECONDS": 20,
+        "suggestion_shown": ("", 0.0),
+        "suggester": None,
+        "gui_config": None,
+        "monotonic": time.monotonic,
+        "shortcuts_for_context": shortcuts_for_context,
         "window_binary": None,
         "window_title": None,
         "xdg_session_type": "wayland",
@@ -106,6 +157,7 @@ def load_driver_state(shortcuts):
         "get_current_value": lambda _entry: None,
         "stop_threads": False,
         "log": type("Log", (), {"info": staticmethod(lambda *a, **k: None),
+                                "exception": staticmethod(lambda *a, **k: None),
                                 "debug": staticmethod(lambda *a, **k: None)})(),
     }
     exec(compile(module, "dialpad.py", "exec"), namespace)

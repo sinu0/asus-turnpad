@@ -13,10 +13,10 @@ sys.path.insert(0, ROOT)
 
 from config.schema import (  # noqa: E402
     DialPadConfig, Profile, SpaceMouseAction, SpaceMouseButton, SpaceMouseConfig,
-    _decoder, _encoder, default_spacemouse_buttons, shell_commands, spacemouse_binds, spacemouse_hold_keys, spacemouse_macros, spacemouse_modifier_keys,
+    _decoder, _encoder, default_spacemouse_buttons, merge_spacemouse_buttons, shell_commands, spacemouse_binds, spacemouse_buttons_for, spacemouse_hold_keys, spacemouse_macros, spacemouse_modifier_keys,
 )
 from config.schema import MacroStep, StepType  # noqa: E402
-from spacemouse_dial import ButtonMachine, ListStepper, SpaceCap  # noqa: E402
+from spacemouse_dial import ButtonMachine, ListStepper, MuteLease, SpaceCap  # noqa: E402
 
 
 def test_driver_state_volume():
@@ -489,12 +489,27 @@ class SpaceMouseConfigTest(unittest.TestCase):
     def test_default_button_map_of_the_spacepilot_pro(self):
         buttons = default_spacemouse_buttons()
         self.assertEqual(buttons["0"].press.type, "dial")
-        for number, index in enumerate(range(17, 22)):
-            self.assertEqual((buttons[str(index)].press.type, buttons[str(index)].press.slot), ("function", number))
-            self.assertEqual(buttons[str(index)].hold.type, "group")
+        # The function keys are dual: a short press is 12..16, the device sends 17..21 for a long one.
+        for number in range(5):
+            short, long = buttons[str(12 + number)], buttons[str(17 + number)]
+            self.assertEqual((short.press.type, short.press.slot), ("function", number))
+            self.assertEqual((long.press.type, long.press.slot), ("function", 5 + number))
+            self.assertIsNone(short.hold)
+            self.assertIsNone(long.hold)
         self.assertEqual(buttons["22"].press.type, "back")
         self.assertEqual([buttons[str(index)].press.modifier for index in (23, 24, 25)], ["Alt", "Shift", "Ctrl"])
-        self.assertEqual(len(buttons), 10)
+        # The cap's motion for other programs: Rotation, Pan/Zoom, +, -.
+        self.assertEqual(
+            [(buttons[str(index)].press.type, buttons[str(index)].press.motion) for index in (26, 27, 29, 30)],
+            [("motion", "rotation"), ("motion", "translation"), ("motion", "faster"), ("motion", "slower")],
+        )
+        self.assertNotIn("28", buttons)
+        self.assertEqual(len(buttons), 19)
+        # No layer is bound by default.
+        self.assertFalse(any(
+            action is not None and action.type == "layer"
+            for button in buttons.values() for action in (button.press, button.hold)
+        ))
 
     def test_imported_shell_steps_of_spacemouse_buttons_are_listed(self):
         shell = SpaceMouseAction("macro", macro=[MacroStep(type=StepType.SHELL, script="rm -rf ~/x")])
@@ -551,6 +566,57 @@ class SpaceMouseConfigTest(unittest.TestCase):
         self.assertFalse(spacemouse_binds(SpaceMouseButton(press=SpaceMouseAction("none"), hold=SpaceMouseAction("none"))))
         self.assertTrue(spacemouse_binds(SpaceMouseButton(press=SpaceMouseAction("none"), hold=SpaceMouseAction("group"))))
         self.assertTrue(spacemouse_binds(SpaceMouseButton(press=SpaceMouseAction("key_hold", keys=["KEY_Z"]))))
+
+    def test_a_label_only_entry_names_the_binding_below_it(self):
+        base = {
+            "1": SpaceMouseButton(press=SpaceMouseAction("dial"), label="Old"),
+            "2": SpaceMouseButton(press=SpaceMouseAction("back"), hold=SpaceMouseAction("select")),
+        }
+        over = {
+            "1": SpaceMouseButton(label="Extrude"),
+            "2": SpaceMouseButton(press=SpaceMouseAction("none")),
+            "3": SpaceMouseButton(label="Nothing below"),
+            "4": SpaceMouseButton(press=SpaceMouseAction("dial")),
+        }
+        merged = merge_spacemouse_buttons(base, over)
+        self.assertEqual(merged["1"], SpaceMouseButton(press=SpaceMouseAction("dial"), label="Extrude"))
+        self.assertEqual(merged["2"], over["2"])  # actions replace the binding below, the hold too
+        self.assertEqual(merged["3"], over["3"])  # no binding below: stays label-only, unbound
+        self.assertFalse(spacemouse_binds(merged["3"]))
+        self.assertEqual(merged["4"], over["4"])
+        # A label-only entry without a label of its own keeps the one below.
+        self.assertEqual(merge_spacemouse_buttons(base, {"1": SpaceMouseButton()})["1"].label, "Old")
+        self.assertEqual(base["1"].label, "Old")  # the inputs are not changed
+
+    def test_global_labels_do_not_drop_the_default_map(self):
+        defaults = default_spacemouse_buttons()
+        config = DialPadConfig()
+        config.spacemouse.buttons = {"12": SpaceMouseButton(label="Extrude")}
+        buttons = spacemouse_buttons_for(config)
+        self.assertEqual(set(buttons), set(defaults))
+        self.assertEqual(buttons["12"].press, defaults["12"].press)
+        self.assertEqual(buttons["12"].label, "Extrude")
+        self.assertEqual({k: b for k, b in buttons.items() if k != "12"}, {k: b for k, b in defaults.items() if k != "12"})
+        # A label on a button the defaults leave unbound stays unbound.
+        config.spacemouse.buttons = {"28": SpaceMouseButton(label="Dominant")}
+        self.assertFalse(spacemouse_binds(spacemouse_buttons_for(config)["28"]))
+        # One entry with an action replaces the defaults; labels are laid over that map.
+        config.spacemouse.buttons = {"5": SpaceMouseButton(press=SpaceMouseAction("dial")), "12": SpaceMouseButton(label="Extrude")}
+        buttons = spacemouse_buttons_for(config)
+        self.assertEqual(set(buttons), {"5", "12"})
+        self.assertFalse(spacemouse_binds(buttons["12"]))
+        config.spacemouse.buttons = {}
+        self.assertEqual(spacemouse_buttons_for(config), defaults)
+
+    def test_a_shared_profile_may_just_label_a_button(self):
+        from config.profile_share import PROFILE_FORMAT, profiles_from_text
+
+        (profile,) = profiles_from_text(json.dumps({
+            "name": "P", "segments": [], "spacemouse_buttons": {"12": {"label": "Extrude"}},
+        }))
+        self.assertEqual(profile.spacemouse_buttons, {"12": SpaceMouseButton(label="Extrude")})
+        self.assertEqual(shell_commands([profile]), [])
+        self.assertIn("with only a \"label\" just names the existing binding", PROFILE_FORMAT)
 
     def test_key_hold_and_none_have_no_commands_to_ask_about(self):
         profile = Profile(name="P", spacemouse_buttons={
@@ -612,6 +678,52 @@ class SpaceMouseConfigTest(unittest.TestCase):
         steps = SpaceMouseAction("macro", keys=["KEY_LEFTCTRL", "KEY_Z"]).steps()
         self.assertEqual([(step.type, step.keys) for step in steps], [(StepType.KEYSTROKE, ["KEY_LEFTCTRL", "KEY_Z"])])
         self.assertEqual(SpaceMouseAction("macro").steps(), [])
+
+
+class MuteLeaseTest(unittest.TestCase):
+    def test_no_lease_by_default(self):
+        lease = MuteLease()
+        self.assertFalse(lease.active(0))
+        self.assertFalse(lease.active(1e9))
+
+    def test_runs_for_the_asked_time(self):
+        lease = MuteLease()
+        lease.grant(3000, 100.0)
+        for now, active in ((100.0, True), (102.9, True), (103.0, False), (200.0, False)):
+            self.assertEqual(lease.active(now), active, now)
+
+    def test_zero_ends_it_and_a_new_grant_replaces_it(self):
+        lease = MuteLease()
+        lease.grant(3000, 10.0)
+        lease.grant(0, 11.0)
+        self.assertFalse(lease.active(11.0))
+        lease.grant(1000, 20.0)
+        lease.grant(3000, 20.5)
+        self.assertTrue(lease.active(23.0))
+
+    def test_never_longer_than_the_maximum(self):
+        lease = MuteLease()
+        lease.grant(10 ** 9, 0.0)
+        self.assertTrue(lease.active(4.9))
+        self.assertFalse(lease.active(5.1))
+        lease.grant(-5, 0.0)
+        self.assertFalse(lease.active(0.0))
+
+    def test_a_clock_that_jumped_back_does_not_stretch_it(self):
+        lease = MuteLease()
+        lease.grant(3000, 1000.0)
+        self.assertFalse(lease.active(100.0))  # 900 s "ahead": gone, not a 15 minute mute
+
+    def test_wanted_by_the_dial_or_a_lease(self):
+        lease = MuteLease()
+        self.assertFalse(lease.wanted(False, True, 0))
+        self.assertFalse(lease.wanted(True, False, 0))  # the dial alone, but the setting says no
+        self.assertTrue(lease.wanted(True, True, 0))
+        lease.grant(2000, 5.0)
+        self.assertTrue(lease.wanted(False, False, 6.0))  # the lease needs neither
+        self.assertTrue(lease.wanted(True, True, 6.0))
+        self.assertFalse(lease.wanted(False, True, 7.5))
+        self.assertTrue(lease.wanted(True, True, 7.5))
 
 
 if __name__ == "__main__":

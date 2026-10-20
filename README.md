@@ -1,13 +1,17 @@
-# Turnpad — a dial for ASUS DialPads, any touchpad or a mouse
+# Turnpad — a dial for ASUS DialPads, any touchpad, a mouse or a 3Dconnexion SpaceMouse
 
-Turnpad turns the DialPad printed on the touchpad of ASUS laptops — or any other touchpad, or a mouse — into an ASUS Dial-style controller on Linux: a radial menu of functions, per-application profiles, an on-screen dial with skins and a settings app.
+Turnpad turns the DialPad printed on the touchpad of ASUS laptops — or any other touchpad, a mouse or a 3Dconnexion SpaceMouse — into an ASUS Dial-style controller on Linux: a radial menu of functions, per-application profiles, an on-screen dial with skins and a settings app.
+
+It is also a companion for the SpaceMouse and the SpacePilot Pro: buttons with short and long press, button layers, per-application cap motion, the SpacePilot Pro's colour screen and a Blender add-on, all on top of `spacenavd` — a replacement for 3DxWare on Linux. See [SpaceMouse and SpacePilot Pro](#spacemouse-and-spacepilot-pro).
 
 > **Based on [asus-linux-drivers/asus-dialpad-driver](https://github.com/asus-linux-drivers/asus-dialpad-driver)**
 > by Lukáš Drahník (GPL-2.0). Turnpad started as a personal fork of it: the touchpad handling,
 > layouts and installer come from that driver, and Turnpad adds features modelled on the Windows
 > [ASUS Dial & Control Panel](https://www.asus.com/proart/software-solutions/asus-dial-and-control-panel/).
-> It was written with substantial help from an AI assistant and has been tested
-> only on a ProArt PX13 (HN7306WV) with GNOME 51 on Wayland. Expect rough edges.
+> It was written with substantial help from an AI assistant. DialPad mode has been tested
+> only on a ProArt PX13 (HN7306WV) with GNOME 51 on Wayland. SpaceMouse mode and the
+> SpacePilot Pro screen were tested on a desktop PC with KDE Plasma 6 (Wayland), a SpacePilot Pro,
+> spacenavd 1.3.1 and Blender 5.2. Expect rough edges.
 
 What Turnpad adds to the original driver:
 
@@ -17,6 +21,14 @@ What Turnpad adds to the original driver:
 - **GNOME Shell overlay**: native radial dial with value gauge, rotation hints and finger position; size, position (anywhere on the screen or next to the mouse pointer) and visibility configurable: always visible, fading while you turn, or a small label instead of the dial — for all apps, per profile or per function.
 - **Guided calibration** that measures the dial on any DialPad touchpad — see [PORTING.md](PORTING.md).
 - **Four modes**: the dial works with the DialPad printed on an ASUS touchpad, with any other touchpad, with just a mouse, or with a 3Dconnexion SpaceMouse — see [Modes](#modes).
+- **SpaceMouse mode**: every button of a SpaceMouse or SpacePilot Pro with a short and a long press (the device's dual-function keys included), button layers, the radial menu and group lists on the cap (tilt to pick, twist to turn, push to choose), and per-application button maps in the packs for Blender, FreeCAD, KiCad and more. Needs `spacenavd`.
+- **SpacePilot Pro screen**: the device's own 320×240 colour screen shows the function keys with their actions, the live dial, every button of the active application, the cap's motion and a clock; its nine keys steer the dial and the pages.
+- **Cap motion per application**: sensitivity, locked and inverted axes, rotation and pan switched off, per profile, given back to `spacenavd` when you leave the application.
+- **App link and Blender add-on**: applications tell the driver their commands and what you are doing (Edit Mesh, Sculpt…); a dial function or a button can run a Blender command by name, and the mode picks the menu through contexts. The settings app installs the add-on.
+- **Contexts**: a profile can change its menu, buttons and screen by window title or by the application's mode.
+- **Setup assistant**: on the first start it looks at your hardware and suggests the modes; a profile for an application without one is offered in a notification, with a ready pack.
+- **Portable settings**: export everything that is not specific to a computer and import it on another; the machine's devices and touchpad geometry stay.
+- **Macro recorder**: *Record…* in the function editor records a macro from the keyboard, with countdown and pauses.
 
 ## Modes
 
@@ -28,6 +40,24 @@ What Turnpad adds to the original driver:
 | **Mouse-only mode** | computer without a touchpad (desktop PC) | a key the mouse sends (F13, e.g. a side button mapped with Piper) | mouse wheel, or move the mouse in circles | left click, or the middle button | right click, or hold the middle button | *Driver → Mouse-only mode* ([details](PORTING.md#mouse-only-mode-computers-without-a-touchpad)) |
 
 In Touchpad mode the whole touchpad is the dial and the pointer stands still while it is on; in Mouse-only mode the driver grabs the mouse while the dial is on. SpaceMouse mode works on a computer without a touchpad, alone or together with Mouse-only mode. Everything else (profiles, functions, on-screen dial, skins) is the same in all modes.
+
+## SpaceMouse and SpacePilot Pro
+
+Turnpad speaks `spacenavd`'s socket protocol as one more client, so it works next to your CAD or 3D program and needs no vendor software. It was written and tested with a SpacePilot Pro; other 3Dconnexion devices get the generic mode (one entry per button, no long presses, no screen).
+
+- **Buttons**: every button has a press action and, where the device allows, a hold action: shortcuts and macros, held modifiers, held keys (hold `Z` for a Blender pie menu), open the dial or a group's list, enter a function, switch a button layer, change the cap's motion, run an application command, or leave the button to the application.
+- **Dual-function keys**: the SpacePilot Pro's function keys, T, R, F, Roll and ISO tell a short from a long press themselves; the settings app shows both as one key with two actions. By default function keys 1–5 enter dial functions 1–5 and, held for a second, 6–10.
+- **The dial on the cap**: open it with Menu, tilt towards a sector, let go to choose; twist turns the dial or a function, pushing the cap is the centre button, Esc goes back.
+- **Layers**: a button switches a second map over the first (while held, for the next press, or until pressed again).
+- **Cap motion per application**: sensitivity and axes of the cap for other programs, per profile, plus Rotation, Pan/Zoom and +/− buttons that change it on the fly.
+- **Screen**: the SpacePilot Pro's colour screen, driven by its own service.
+- **Ready maps**: the packs for GIMP, Krita, Inkscape, darktable, Blender, FreeCAD, KiCad, Kdenlive and DaVinci Resolve carry a button map with labels for the screen.
+
+![SpacePilot Pro screen: function keys](./preview/screen-keys.png) ![SpacePilot Pro screen: the dial](./preview/screen-dial.png)
+
+![SpaceMouse page of the settings app](./preview/settings-spacemouse.png)
+
+You need `spacenavd` 1.3 or newer running (the optional `pyusb` is only for the screen). Everything is set up on the *SpaceMouse* page of the settings app. Guide: [SPACEMOUSE.md](SPACEMOUSE.md); more pictures: [GALLERY.md](GALLERY.md#spacepilot-pro-screen). SpaceMouse mode is ignored on a computer where a DialPad or Touchpad mode is in use ([PORTING.md](PORTING.md#spacemouse-mode-a-3dconnexion-spacemouse)).
 
 ### Install
 
@@ -48,7 +78,9 @@ cd asus-turnpad
 bash install.sh
 ```
 
-Then log out and back in, switch the dial on (DialPad mode: hold the illuminated corner of the touchpad; for Touchpad mode and Mouse-only mode see [Modes](#modes)), and open **Turnpad** from the applications menu. On a laptop that is not listed, run *Calibration → Guided calibration* there once.
+For SpaceMouse mode also install `spacenavd` (AUR `spacenavd` on Arch, packages of the same name elsewhere) and, for the SpacePilot Pro's screen, `pyusb` — see [INSTALL.md](INSTALL.md#the-screen-of-a-spacepilot-pro) and [SPACEMOUSE.md](SPACEMOUSE.md#what-you-need).
+
+Then log out and back in, switch the dial on (DialPad mode: hold the illuminated corner of the touchpad; for Touchpad mode and Mouse-only mode see [Modes](#modes)), and open **Turnpad** from the applications menu: on its first start it looks at your hardware and suggests the mode (Driver → *Set up…* does it again). On a laptop that is not listed, run *Calibration → Guided calibration* there once.
 
 | | Arch package | `install.sh` |
 | --- | --- | --- |
@@ -109,12 +141,17 @@ Everything is set up in the **Turnpad** app (applications menu); changes apply i
 - Pre-programmed packs, basic or advanced, for browsers, GIMP, Krita, Inkscape, darktable, Blender, Kdenlive, DaVinci Resolve, Shotcut, Audacity, OBS Studio, LibreOffice, code editors, file managers, Spotify and video players; import/export of profiles
 - Launchers: a function with only a tap action runs as soon as it is chosen in the radial menu, like the radial menus of 3D mice. The library has Calculator, Terminal, Files, Screenshot, Lock screen and My script (any command or bash script); programs keep running without blocking the dial
 - Groups (folders): a sector of the menu that opens a straight list of more functions beside the dial, one level deep. The library's *Apps* group holds all the launchers; *Group* under Custom starts an empty one, and functions already on the dial can be moved into it
+- Contexts: a profile can have contexts that apply while the window title contains some text (`|` for alternatives) or while the application reports a mode (Blender: Edit Mesh, Sculpt…). A context can have its own dial menu, SpaceMouse buttons and screen start page; the first one that matches wins
+- Profile offers: when you focus an application that has no profile but a ready pack, the driver shows a notification with a *Create profile* button that opens the settings app on that application (it asks for the basic or advanced variant)
+- Portable settings: Driver → *Export all settings* / *Import settings* move profiles, dial look, gesture feel and SpaceMouse buttons between computers; devices, modes and touchpad geometry stay on each machine
+- First start: a setup assistant looks at the hardware and suggests DialPad, Touchpad or Mouse-only mode and SpaceMouse mode; Driver → *Set up…* runs it again. Pages that do not fit the hardware (Calibration, SpaceMouse, Screen) hide until needed; *Show all pages* brings them back
 
 **Functions**
 
 - Library of ready functions: volume, brightness, keyboard light, mute, workspaces, vertical/horizontal scroll, zoom, tabs, back/forward, arrow keys, media tracks, seek, undo/redo, font size, brush size, frame stepping, timeline zoom
 - Own colour, order on the dial, show/hide, rotation step and an optional live value (e.g. volume in % with a level gauge)
 - Separate actions for turning clockwise, counter-clockwise and tapping; each action can be a keyboard shortcut (recorded from the keyboard, clicked together from key buttons or typed as `Ctrl+F12`; the ⓘ button in the action editor explains it), media key, volume, brightness, vertical or horizontal scroll (optionally with Ctrl/Shift/Alt held, e.g. Ctrl + wheel zoom), a shell command or a wait — several steps run in order
+- Macro recorder: *Record…* next to *+* in the action editor records keys from the keyboard after a 3-2-1 countdown (a held modifier plus a key is one step), optionally keeping your pauses as Wait steps, and appends them to the macro or replaces it
 - Other actions while Ctrl, Shift or Alt is held on the keyboard, e.g. Volume: tap mutes, Ctrl + tap opens the mixer; Brush size: Shift + turn changes the hardness. Without its own action for a held key a function does what it always does
 
 **Using the dial**
@@ -134,6 +171,15 @@ Everything is set up in the **Turnpad** app (applications menu); changes apply i
 - Skins: Dark glass, Midnight (OLED black), Frost (light), ProArt bronze and Classic segments, optionally following the system light/dark style; the skin editor creates your own with a live preview, and its "Copy prompt for AI" / "Paste JSON" pair lets any AI assistant design one ([SKINS.md](SKINS.md))
 - KDE Plasma 6, Hyprland, sway, niri, COSMIC: the same dial on the compositor's overlay layer (gtk4-layer-shell), with the same skins and settings
 - X11 sessions: the original PySide overlay (own `.svg` icons; double-click to unlock its position and move it)
+
+**SpaceMouse** (3Dconnexion, through `spacenavd`; [SPACEMOUSE.md](SPACEMOUSE.md))
+
+- Every button with a press and a hold action: macro, held modifier, held keys, dial, group, function, select, back, layer, cap motion, application command, or none; the physical keys of the SpacePilot Pro grouped as on the device
+- Release to select: hold the opening button, tilt towards a tile, let go; twist turns the dial, a push is the centre
+- Button layers (hold, once, toggle), globally and per application
+- Per-application button maps and cap motion (sensitivity, per-axis sensitivity and direction, rotation and pan on or off); `hide_buttons` keeps the buttons Turnpad uses from other programs, `mute_others` silences them while the dial is on
+- The SpacePilot Pro's screen: Keys, Dial, All buttons, Motion and Clock pages, quick settings, themes, per-application start page, accent and labels
+- App commands: a button or function can run a command of the focused application through the app link; the Blender add-on is installed from the settings app
 
 **Base driver** (from the original project)
 
@@ -179,7 +225,9 @@ Use the **Turnpad** app for every setting:
 | **Skins** | Skin gallery and editor, separate skins for light and dark style, on-screen dial size, position (also a custom place), visibility (always, fade while turning to a chosen opacity, small label), visibility time, hints, finger position, progress arc and accent colour |
 | **Behaviour** | Corner icon hold time, co-activator keys, switching off after inactivity, DialPad light (follows the keyboard backlight including off, or a fixed level 0–8 where 0 keeps it off), default rotation step, jitter filter, centre hold time, minimum menu sectors |
 | **Calibration** | Guided calibration (trace the ring and the centre button, then keep or revert the result), manual dial geometry and corner icon area, reset to the layout's geometry |
-| **Driver** | Driver status, active profile and function, the configuration the driver runs (and why it refused a newer one), reload, configuration folder |
+| **Driver** | Driver status, active profile and function, the configuration the driver runs (and why it refused a newer one), reload, configuration folder, the modes and devices (*Set up…*), export and import of all settings |
+| **SpaceMouse** | The device and `spacenavd` status, the buttons with press and hold actions, layers, per-application overrides, cap motion, the Blender add-on (shown when a SpaceMouse is found or the mode is on) |
+| **Screen** | The SpacePilot Pro's screen: preview, look, power, pages, per-application settings (shown when the screen is present) |
 
 **Building a profile with an AI assistant.** At the bottom of Dial Controls, *Copy prompt for AI* copies a description of the profile format together with the current profile. Paste it into ChatGPT, Claude or any other assistant, add what you want (“Inkscape: zoom, rotate canvas, layers, undo”), copy the whole answer and choose *Paste from AI*. The app reads the JSON out of the answer, accepts short key names such as `Ctrl`, explains what is wrong if something is not usable, lists every shell command before you accept, and then replaces the profile or adds it as a new one.
 
@@ -191,7 +239,7 @@ You do not need to edit these files; they are described for backups and troubles
 
 | File | Content |
 | --- | --- |
-| `~/.config/asus-turnpad/config.json` | Everything set in the app: profiles, functions, behaviour, on-screen dial and dial geometry. Written atomically; the driver and the GNOME extension reload it after every change. The driver checks the file first and keeps its running settings when it cannot use it (the **Driver** page says why), and applies a change only between two touches of the dial. Use *Import/Export* to move profiles between computers. |
+| `~/.config/asus-turnpad/config.json` | Everything set in the app: profiles, functions, behaviour, on-screen dial and dial geometry. Written atomically; the driver and the GNOME extension reload it after every change. The driver checks the file first and keeps its running settings when it cannot use it (the **Driver** page says why), and applies a change only between two touches of the dial. Use *Import/Export* to move profiles between computers, or Driver → *Export all settings* / *Import settings* to move everything that is not specific to a computer (profiles, dial look, gesture feel, SpaceMouse buttons; not the touchpad geometry, devices or modes). |
 | `~/.config/asus-turnpad/dialpad_dev` | Runtime state of the driver: `enabled` (DialPad on/off) and `socket_enabled` (messages for the PySide overlay on other desktops; the GNOME overlay does not need it). Its other keys come from the original driver and are ignored while `config.json` exists. |
 | `/opt/asus-turnpad/layouts/*.py` | Default geometry of each touchpad family and the original Python format of shortcuts. Used only until `config.json` exists — the first start of the app converts them. |
 
@@ -217,6 +265,8 @@ Then check the service logs:
 $ journalctl --user -u asus-turnpad.service
 $ systemctl --user restart asus-turnpad.service
 ```
+
+SpaceMouse mode logs to the same service; the SpacePilot Pro's screen has its own (`journalctl --user -u asus-turnpad-screen.service`). More in [SPACEMOUSE.md](SPACEMOUSE.md#troubleshooting).
 
 The driver state and the messages for the on-screen dial are available on the session D-Bus:
 

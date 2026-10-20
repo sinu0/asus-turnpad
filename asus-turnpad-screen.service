@@ -1,0 +1,23 @@
+[Unit]
+Description=Turnpad on the SpaceMouse screen
+# The screen of a SpacePilot Pro (install_screen.sh). Started by the udev rule
+# of the device (SYSTEMD_USER_WANTS) when it is plugged in, so there is no
+# [Install] section; it stops when the device goes (the program exits).
+# Not for the user managers of display managers (gdm, sddm greeters are system
+# users): they must not take the screen away from the person who logs in.
+ConditionUser=!@system
+StartLimitBurst=20
+StartLimitIntervalSec=300
+
+[Service]
+Type=simple
+# The service drives the screen over USB and needs no privileges; it can never
+# gain any (sudo, pkexec and other setuid helpers fail), even with passwordless sudo.
+NoNewPrivileges=yes
+ExecStart=$PYTHON $INSTALL_DIR_PATH/screen/service.py
+TimeoutSec=5
+Restart=on-failure
+RestartSec=2
+# Exit status 3: no supported screen, pyusb is missing or the screen is
+# switched off in the settings, so starting again would not help.
+RestartPreventExitStatus=3

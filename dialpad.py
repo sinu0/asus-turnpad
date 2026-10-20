@@ -5,7 +5,7 @@ import os
 import importlib
 import sys
 import threading
-from time import sleep, time
+from time import monotonic, sleep, time
 
 # X11 libraries are only needed in X11 sessions (python-xlib, xcffib from the distribution).
 X11_LIBS_AVAILABLE = False
@@ -48,7 +48,8 @@ import launch
 import layout_detect
 from dir_watch import DirectoryWatcher
 from mouse_dial import MouseDial, MousePointer, find_mouse
-from spacemouse_dial import ButtonMachine, ListStepper, SpaceCap
+from spacemouse_dial import ButtonMachine, LayerState, ListStepper, MotionSession, MuteLease, SpaceCap
+from spacemouse_dial import motion_neutral, motion_values
 from spacenav_client import (
     EVMASK_RAWAXIS,
     EVMASK_RAWBUTTON,
@@ -63,9 +64,12 @@ from spacenav_client import (
 )
 from desktop import keyboard_layout
 from backlight import KeyboardBacklight, commands_for_level
-from config.identity import SLUG, socket_path
+from config.identity import APP_ID, SLUG, socket_path
 from desktop.active_window import ActiveWindow, Context as ActiveWindowContext
 from desktop import kwin_script
+from desktop import notifications
+import app_suggest
+from app_link import AppLink, BUSY, NO_CLIENT, SENT, UNKNOWN_COMMAND
 from dial_gesture import (
     CalibrationSession,
     DEFAULT_HYSTERESIS,
@@ -79,18 +83,20 @@ from dial_gesture import (
 )
 
 try:
-    from dialpad_dbus import DialPadDBusService
+    from dialpad_dbus import DialPadDBusService, parse_control
     DBUS_SERVICE_AVAILABLE = True
 except Exception:
     DialPadDBusService = None
+    parse_control = None
     DBUS_SERVICE_AVAILABLE = False
 
 try:
     from config.schema import CONFIG_DIR, CONFIG_FILE, MacroStep, StepType, config_from_text
     from config.schema import MODIFIER_KEYS as SCHEMA_MODIFIER_KEYS
-    from config.schema import spacemouse_binds, spacemouse_buttons_for, spacemouse_hold_keys
+    from config.schema import merge_spacemouse_buttons, spacemouse_binds, spacemouse_buttons_for, spacemouse_hold_keys
     from config.schema import spacemouse_macros, spacemouse_modifier_keys
-    from config.legacy_adapter import META_KEY, shortcuts_from_config
+    from config.schema import effective_motion, merge_spacemouse_layers
+    from config.legacy_adapter import META_KEY, shortcuts_for_context, shortcuts_from_config
     from config.runtime import MacroExecutionError, MacroExecutor
     CONFIG_APP_AVAILABLE = True
 except Exception:
@@ -99,14 +105,18 @@ except Exception:
     SCHEMA_MODIFIER_KEYS = None
     spacemouse_binds = None
     spacemouse_buttons_for = None
+    merge_spacemouse_buttons = None
     spacemouse_hold_keys = None
     spacemouse_macros = None
     spacemouse_modifier_keys = None
+    effective_motion = None
+    merge_spacemouse_layers = None
     MacroStep = None
     StepType = None
     config_from_text = None
     META_KEY = "_meta"
     shortcuts_from_config = None
+    shortcuts_for_context = None
     MacroExecutionError = None
     MacroExecutor = None
     CONFIG_APP_AVAILABLE = False
@@ -116,9 +126,14 @@ SOCKET_PATH = socket_path()
 # crash can be undone at the next start; an unused button index to hide buttons on.
 SPACENAV_RESTORE_FILE = str(CONFIG_DIR / "spacenav-restore.json") if CONFIG_DIR is not None else ""
 SPACENAV_UNUSED_BUTTON = 63
+# Control "mute:MS": another program (the SpacePilot screen's game) asks to silence the
+# other spacenavd clients for a while; the SpaceMouse source reads it every pass.
+spacemouse_mute = MuteLease()
 sock = None
 dbus_service = None
 driver_state_lock = threading.RLock()
+# Orders the snapshots publish_driver_state() hands to the D-Bus service; nothing else is taken under it.
+driver_state_publish_lock = threading.Lock()
 pending_active_application = None
 pending_config_reload = False
 # Configuration read and checked by ReloadConfig, applied by the touch loop
@@ -127,6 +142,30 @@ pending_gui_config = None
 # The applied config.json (first characters of its SHA-256), why a newer one
 # was not applied, and whether one waits for the finger to lift (GetStatus).
 config_status = {"revision": "", "error": "", "pending": False}
+# Commands from other programs (the D-Bus method Control, e.g. the keys of a
+# SpaceMouse screen): parsed tuples (see dialpad_dbus.parse_control), applied
+# by the input loop in process_pending_driver_updates().
+pending_controls = []
+PENDING_CONTROLS_MAX = 32
+# The focused window's title as a push (SetActiveWindow) delivers it, applied
+# with the pending application; None = no push, the polled window_title counts.
+pending_window_title = None
+pending_window_title_set = False
+pushed_window_title = None
+# The app link's context changed (its thread asks the input loop to look again).
+pending_context_refresh = False
+# The profile context in force ("" = the plain profile).
+context_name = ""
+# The app link server (app_link.py), None when it did not start.
+app_link = None
+# The last thing worth telling the user on a device screen: a command that could
+# not run. "until" is when it stops counting for the DriverState.
+APP_NOTICE_SECONDS = 6
+app_notice = {"id": 0, "text": "", "until": 0.0}
+# The once-per-application offer of a ready profile (app_suggest.py): the pack on offer and until when.
+suggester = None
+SUGGESTION_SECONDS = 20
+suggestion_shown = ("", 0.0)
 # The mouse dial's and SpaceMouse's sources (listen_input_sources), for GetStatus and cleanup().
 input_sources = []
 # Guided calibration: requested over D-Bus, run on the touch thread.
@@ -146,11 +185,33 @@ def init_socket():
         sock = None
 
 def on_dbus_active_application(app_id):
-    global pending_active_application
+    global pending_active_application, pending_window_title, pending_window_title_set
 
     normalized_app_id = str(app_id).strip().lower() if app_id is not None else None
     with driver_state_lock:
         pending_active_application = normalized_app_id or None
+        if normalized_app_id:
+            # This caller knows no title: the polled one counts again.
+            pending_window_title = None
+            pending_window_title_set = True
+
+def on_dbus_active_window(app_id, window_title_text):
+    """SetActiveWindow: the focused application and the window's title (a KWin
+    script that follows caption changes, the Shell extension)."""
+    global pending_active_application, pending_window_title, pending_window_title_set
+
+    normalized_app_id = str(app_id).strip().lower() if app_id is not None else None
+    with driver_state_lock:
+        pending_active_application = normalized_app_id or None
+        if normalized_app_id:
+            pending_window_title = str(window_title_text or "")[:300]
+            pending_window_title_set = True
+
+def on_dbus_app_commands(app):
+    """GetAppCommands: the catalog of the linked application as JSON."""
+    if app_link is None:
+        return json.dumps({"app": str(app), "name": "", "version": "", "connected": False, "context": {}, "commands": []})
+    return json.dumps(app_link.commands(str(app)))
 
 def on_dbus_reload_config():
     """Read and check config.json now; the touch loop applies it between gestures.
@@ -182,6 +243,7 @@ def process_pending_driver_updates(gesture_idle=True):
     or virtual devices.
     """
     global pending_active_application, pending_config_reload, pending_calibration, pending_gui_config
+    global pending_window_title, pending_window_title_set, pushed_window_title, pending_context_refresh
 
     with driver_state_lock:
         calibration_request = pending_calibration
@@ -190,12 +252,27 @@ def process_pending_driver_updates(gesture_idle=True):
             active_application = pending_active_application
             reload_config = pending_config_reload
             prepared = pending_gui_config
+            controls = list(pending_controls)
+            title_pushed = pending_window_title_set
+            new_window_title = pending_window_title
+            refresh_context = pending_context_refresh
             pending_active_application = None
             pending_config_reload = False
             pending_gui_config = None
+            pending_window_title = None
+            pending_window_title_set = False
+            pending_context_refresh = False
+            pending_controls.clear()
         else:
             active_application = None
             reload_config = False
+            controls = []
+            title_pushed = False
+            new_window_title = None
+            refresh_context = False
+
+    if title_pushed:
+        pushed_window_title = new_window_title
 
     if calibration_request == "start":
         start_calibration()
@@ -206,10 +283,23 @@ def process_pending_driver_updates(gesture_idle=True):
         if apply_gui_config(prepared) and active_application is None:
             active_application = window_binary
 
+    if refresh_context and active_application is None:
+        # The linked application's mode changed: the profile's contexts are looked at again.
+        active_application = window_binary
+
     if active_application is not None:
         # After a reload, colours, hints and titles may have changed even
         # when the application did not.
         window_was_changed(active_application, force=reload_config)
+
+    # After the application: a command meets the profile it was sent for.
+    for command in controls:
+        try:
+            apply_control(command)
+        except Exception:
+            log.exception("Control command %r failed", command)
+
+    publish_driver_state()
 
 def on_dbus_start_calibration():
     global pending_calibration
@@ -225,6 +315,25 @@ def on_dbus_toggle():
     # The action thread switches, so a shortcut never waits for the touchpad
     # grab or the pointer setting.
     enqueue_action(lambda: toggle_top_right_icon(dialpad))
+    return True
+
+def on_dbus_control(command):
+    """Queue a dial command (D-Bus Control) for the input loop. True when it
+    was understood, not when it changed anything; a command for a button that
+    does nothing a command can do is not understood."""
+    parsed = parse_control(command) if parse_control is not None else None
+    if parsed is None:
+        return False
+    if parsed[0] == "button" and control_button_action(parsed[1]) is None:
+        return False
+    if parsed[0] == "mute":
+        # A lease, not a command for the input loop: it must not wait for a gesture.
+        spacemouse_mute.grant(parsed[1], time())
+        return True
+    with driver_state_lock:
+        if len(pending_controls) >= PENDING_CONTROLS_MAX:
+            del pending_controls[0]
+        pending_controls.append(parsed)
     return True
 
 def on_dbus_cancel_calibration():
@@ -325,6 +434,69 @@ def get_dbus_status():
         "config_pending": config_state["pending"],
     }
 
+def driver_state():
+    """What other programs (the SpaceMouse screen) follow, as the DriverState
+    signal carries it. Read-only; callable from any thread. It takes no lock:
+    publish_driver_state() is called with driver_state_lock held, and the
+    D-Bus thread calls this for GetDriverState."""
+    config_revision = config_status["revision"]
+    held = [getattr(key, "name", str(key)) for key in list(spacemouse_applied_keys)]
+    modifiers = []
+    for name, keys in (SCHEMA_MODIFIER_KEYS or {}).items():
+        if keys[0] in held:
+            modifiers.append(name)
+            held.remove(keys[0])
+    spacemouse_source = next((source for source in input_sources if source.name == "spacemouse" and source.connected), None)
+    return {
+        "profile": str(profile_meta().get("name") or ""),
+        "app": window_binary or "",
+        "dial": bool(dialpad),
+        "mode": "multi" if multi_app_mode else "single",
+        "group": submenu or "",
+        "function": (globals().get("title") or "") if globals().get("center_activated", False) else "",
+        "modifiers": modifiers,
+        "keys_held": held,
+        "spacemouse": spacemouse_source is not None,
+        "spacemouse_device": spacemouse_source.device_name if spacemouse_source is not None else "",
+        "layer": spacemouse_source.layers.active if spacemouse_source is not None else "",
+        "motion": dict(spacemouse_source.motion_shown) if spacemouse_source is not None else {
+            "sensitivity": 1.0, "rotation": True, "translation": True,
+        },
+        "config_revision": config_revision,
+        "app_link": app_link is not None and app_link.connected(window_binary),
+        "app_context": app_link.context_for(window_binary) if app_link is not None else {},
+        "context": context_name,
+        "suggest": suggestion_shown[0] if monotonic() < suggestion_shown[1] else "",
+        "notice": app_notice_state(),
+    }
+
+def app_notice_state():
+    """The last notice while it counts ({id, text}), else {}."""
+    if app_notice["text"] and monotonic() < app_notice["until"]:
+        return {"id": app_notice["id"], "text": app_notice["text"]}
+    return {}
+
+def set_app_notice(text):
+    """Tell the screens something that did not work (DriverState "notice")."""
+    global app_notice
+
+    log.info("%s", text)
+    app_notice = {"id": app_notice["id"] + 1, "text": str(text), "until": monotonic() + APP_NOTICE_SECONDS}
+    publish_driver_state()
+
+def publish_driver_state():
+    """Tell the D-Bus service the current driver state; it sends the signal
+    only when the state differs from the last one, so calling this often is cheap.
+    Computing and handing over happen under one lock, so an older snapshot
+    cannot arrive after a newer one."""
+    if not dbus_service:
+        return
+    try:
+        with driver_state_publish_lock:
+            dbus_service.emit_driver_state(driver_state())
+    except Exception:
+        log.exception("Failed to publish the driver state")
+
 # KDE Plasma: a KWin script pushes the focused application (desktop/kwin_script.py).
 kde_script = None
 kde_script_closed = False
@@ -362,6 +534,99 @@ def stop_kwin_script():
         except Exception as error:
             log.debug("Could not unload the KWin script: %s", error)
 
+# The app link (app_link.py): applications with an add-on (Blender) tell the
+# driver their commands and mode, and run commands on request.
+
+def on_app_link_change(kind):
+    """The link server's thread: an application came, went or changed its mode.
+    The profile contexts are looked at again by the input loop."""
+    global pending_context_refresh
+
+    if kind in ("hello", "context", "gone"):
+        with driver_state_lock:
+            pending_context_refresh = True
+    publish_driver_state()
+
+def on_app_link_result(app, command_id, ok, error):
+    if ok:
+        log.debug("%s ran %s", app, command_id)
+    else:
+        set_app_notice("%s: %s failed%s" % (app, command_id, ": " + error if error else ""))
+
+def run_app_command(command, fallback_keys=None):
+    """An app step (action thread): ask the focused application's add-on to run
+    ``command``. Without a connected add-on, or when it does not know the command,
+    the fallback keys are pressed; without those the failure is logged and shown
+    on the screens. True when the command was handed to the add-on."""
+    outcome, linked = app_link.run(window_binary, command) if app_link is not None else (NO_CLIENT, "")
+    if outcome == SENT:
+        return True
+    keys = [key for key in fallback_keys or [] if isinstance(key, str) and key]
+    if keys:
+        resolved = [resolve_evdev_key(key) for key in keys]
+        send_key_event(resolved[0] if len(resolved) == 1 else resolved)
+        log.debug("%s: %s -> shortcut %s", outcome, command, "+".join(keys))
+        return False
+    if outcome == UNKNOWN_COMMAND:
+        set_app_notice("%s does not know the command %s" % (linked or "The application", command))
+    elif outcome == BUSY:
+        set_app_notice("%s is busy: %s skipped" % (linked or "The application", command))
+    else:
+        set_app_notice("No Turnpad add-on connected: %s skipped" % command)
+    return False
+
+def start_app_link():
+    global app_link, suggester
+
+    if CONFIG_DIR is not None and suggester is None:
+        try:
+            suggester = app_suggest.Suggester(CONFIG_DIR / "suggested.json")
+        except Exception:
+            log.exception("The profile offers are off")
+    link = AppLink(on_change=on_app_link_change, on_result=on_app_link_result)
+    if link.start():
+        app_link = link
+
+def stop_app_link():
+    global app_link
+
+    link, app_link = app_link, None
+    if link is not None:
+        link.stop()
+
+def suggest_profile(window_id):
+    """An application with a ready-made pack but no profile got the focus: offer
+    the profile once per application (a notification with a button, and the
+    DriverState "suggest" for the screens)."""
+    global suggestion_shown
+
+    if suggester is None or gui_config is None:
+        return
+    suggestion = suggester.consider(window_id, profile_exists_for_window(window_id))
+    if suggestion is None:
+        return
+    log.info("Offering the ready profile %s for %s", suggestion.pack, suggestion.window_id)
+    suggestion_shown = (suggestion.pack, monotonic() + SUGGESTION_SECONDS)
+    threading.Thread(target=send_profile_offer, args=(suggestion,), name="dialpad-offer", daemon=True).start()
+
+def send_profile_offer(suggestion):
+    try:
+        notifications.ActionNotifier().notify(
+            "Ready profile for %s" % suggestion.pack,
+            "Turnpad has a dial menu and buttons for %s. Create the profile?" % suggestion.pack,
+            [("create", "Create profile")],
+            lambda key: open_add_profile(suggestion) if key == "create" else None,
+            icon=APP_ID,
+        )
+    except Exception as error:
+        log.info("No notification for the profile offer (%s)", error)
+
+def open_add_profile(suggestion):
+    """The settings app, asked to add the profile (it starts the pack flow)."""
+    program = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config_app", "main.py")
+    argv = [sys.executable or "python3", program, "--add-profile=" + suggestion.app_id]
+    threading.Thread(target=launch.run, args=(argv,), name="dialpad-settings", daemon=True).start()
+
 def init_dbus():
     global dbus_service
 
@@ -376,6 +641,10 @@ def init_dbus():
             status_provider=get_dbus_status,
             on_cancel_calibration=on_dbus_cancel_calibration,
             on_toggle=on_dbus_toggle,
+            on_control=on_dbus_control,
+            driver_state_provider=driver_state,
+            on_active_window=on_dbus_active_window,
+            on_app_commands=on_dbus_app_commands,
         )
     except Exception:
         log.exception("Failed to create the DialPad D-Bus service")
@@ -963,6 +1232,8 @@ def send_to_socket(payload: dict):
             dbus_service.emit_overlay_state(payload)
         except Exception:
             log.exception("Failed to emit DialPad D-Bus overlay state")
+        # Profile, dial, group and function changes all pass here.
+        publish_driver_state()
 
     # Presentation details are D-Bus only; the legacy socket overlay does not
     # understand them.
@@ -1253,7 +1524,7 @@ def enable_config_macro_capabilities(reset_udev=False):
 
     def process_macro(macro):
         for step in macro:
-            if step.type in (StepType.KEYSTROKE, StepType.MEDIA, StepType.VOLUME, StepType.BRIGHTNESS):
+            if step.type in (StepType.KEYSTROKE, StepType.MEDIA, StepType.VOLUME, StepType.BRIGHTNESS, StepType.APP):
                 enable_macro_keys(step.keys)
             if step.type is StepType.SCROLL:
                 enable_key([EV_REL.REL_WHEEL, EV_REL.REL_WHEEL_HI_RES])
@@ -1394,31 +1665,41 @@ def get_active_window_title():
 
 GENERIC_DESKTOP_ID_WORDS = {"studio", "desktop", "app", "editor", "client", "player", "viewer"}
 
+def profile_matches_window(profile_id, value):
+    """Match a desktop id as well as the human app name supplied by AT-SPI."""
+    if not value:
+        return False
+    profile_id = str(profile_id).lower()
+    value = str(value).lower()
+    stem = profile_id.removesuffix(".desktop")
+    candidates = {profile_id, stem}
+    # GNOME Shell gives ``org.darktable.darktable.desktop``, while
+    # PyAT-SPI commonly supplies just ``Darktable``.  The final desktop-id
+    # component is the stable bridge between the two forms.
+    # A generic last component ("com.obsproject.Studio") would also match
+    # unrelated apps such as LM Studio; the vendor part is used instead.
+    if "." in stem:
+        parts = stem.split(".")
+        last_component = parts[-1]
+        if last_component in GENERIC_DESKTOP_ID_WORDS and len(parts) >= 3:
+            last_component = parts[-2]
+        if len(last_component) >= 3 and last_component not in GENERIC_DESKTOP_ID_WORDS:
+            candidates.add(last_component)
+    return any(candidate and candidate in value for candidate in candidates)
+
+def profile_exists_for_window(window_id):
+    """Whether any profile of the configuration (an empty one too, which the shortcut
+    sets leave out) is selected for this application."""
+    if gui_config is None or not window_id:
+        return False
+    return any(
+        profile.app_id and profile_matches_window(profile.app_id, window_id)
+        for profile in gui_config.profiles
+    )
+
 def get_appropriate_app_name_and_shortcuts(window_binary, window_title):
 
     app_name = None
-
-    def profile_matches_window(profile_id, value):
-        """Match a desktop id as well as the human app name supplied by AT-SPI."""
-        if not value:
-            return False
-        profile_id = str(profile_id).lower()
-        value = str(value).lower()
-        stem = profile_id.removesuffix(".desktop")
-        candidates = {profile_id, stem}
-        # GNOME Shell gives ``org.darktable.darktable.desktop``, while
-        # PyAT-SPI commonly supplies just ``Darktable``.  The final desktop-id
-        # component is the stable bridge between the two forms.
-        # A generic last component ("com.obsproject.Studio") would also match
-        # unrelated apps such as LM Studio; the vendor part is used instead.
-        if "." in stem:
-            parts = stem.split(".")
-            last_component = parts[-1]
-            if last_component in GENERIC_DESKTOP_ID_WORDS and len(parts) >= 3:
-                last_component = parts[-2]
-            if len(last_component) >= 3 and last_component not in GENERIC_DESKTOP_ID_WORDS:
-                candidates.add(last_component)
-        return any(candidate and candidate in value for candidate in candidates)
 
     # 1. window_binary (exact match)
     if window_binary:
@@ -1579,6 +1860,7 @@ def execute_config_macro(steps, scroll_multiplier=1):
             run_program=run_program,
             run_shell=execute_command,
             sleep=sleep,
+            run_app=run_app_command,
         ).execute(steps)
     except MacroExecutionError as error:
         log.error("Configuration macro failed: %s", error)
@@ -2206,7 +2488,7 @@ def enter_function(function_title, query_value=True):
     center_activated = True
     title = function_title
     if app_name and profile_meta().get("remember_last", True):
-        last_function_by_app[app_name] = (submenu, function_title)
+        last_function_by_app[function_memory_key()] = (submenu, function_title)
     if overlay_enabled():
         send_function_details(function_title)
         send_to_socket({
@@ -2232,11 +2514,16 @@ def show_single_function():
         function_title = title
         enqueue_action(lambda: send_function_value(settings, function_title))
 
+def function_memory_key():
+    """What the last used function is remembered under: the profile, and the
+    context in force when it has one."""
+    return (app_name, context_name) if context_name else app_name
+
 def remembered_function():
     """(group, function) to reopen for this application, or None."""
     if not multi_app_mode or not profile_meta().get("remember_last", True):
         return None
-    remembered = last_function_by_app.get(app_name)
+    remembered = last_function_by_app.get(function_memory_key())
     if not isinstance(remembered, tuple) or len(remembered) != 2:
         return None
     group, function_title = remembered
@@ -2400,7 +2687,7 @@ def return_to_multifunction_menu():
     selected_title = title
     reset_center()
     # Leaving a function on purpose means the next activation opens the menu.
-    last_function_by_app.pop(app_name, None)
+    last_function_by_app.pop(function_memory_key(), None)
     show_multifunction_menu()
     log.info("Returned to the DialPad menu from %s", selected_title)
 
@@ -2409,7 +2696,7 @@ def leave_function():
     anything else to the menu."""
     if submenu and center_activated:
         titles = submenu_titles()
-        last_function_by_app.pop(app_name, None)
+        last_function_by_app.pop(function_memory_key(), None)
         open_submenu(submenu, titles.index(title) if title in titles else 0)
     else:
         return_to_multifunction_menu()
@@ -2626,20 +2913,53 @@ def enter_named_function(function_title=None, slot=None):
             return select_multifunction_segment()
     return False
 
-def spacemouse_effective_buttons():
+def spacemouse_layer_maps():
+    """The button layers in force: the global ones with the current profile's
+    over them, per layer (name -> button map)."""
+    layers = {}
+    if gui_config is not None:
+        layers = {name: dict(buttons) for name, buttons in gui_config.spacemouse.layers.items()}
+    profile_layers = profile_meta().get("spacemouse_layers")
+    if isinstance(profile_layers, dict) and profile_layers:
+        layers = merge_spacemouse_layers(layers, profile_layers)
+    return layers
+
+def spacemouse_effective_buttons(layer=""):
     """The map in force: the global one with the current profile's buttons over it
-    (a profile's binding replaces the global one of that button, ``none`` included)."""
+    (a profile's binding replaces the global one of that button, ``none`` included;
+    an entry that only has a label just names the binding below it). With a
+    ``layer`` active, that layer's buttons lie over the result in the same way."""
     buttons = {}
     if gui_config is not None and spacemouse_buttons_for is not None:
         buttons.update(spacemouse_buttons_for(gui_config))
     profile_buttons = profile_meta().get("spacemouse_buttons")
     if isinstance(profile_buttons, dict):
-        buttons.update(profile_buttons)
+        buttons = merge_spacemouse_buttons(buttons, profile_buttons) if merge_spacemouse_buttons is not None else {**buttons, **profile_buttons}
+    if layer:
+        layer_buttons = spacemouse_layer_maps().get(layer)
+        if layer_buttons:
+            buttons = merge_spacemouse_buttons(buttons, layer_buttons)
     return buttons
 
-def spacemouse_binding(index):
-    """The actions of a SpaceMouse button: the profile's, else the global map's."""
-    return spacemouse_effective_buttons().get(str(index))
+def spacemouse_binding(index, layer=""):
+    """The actions of a SpaceMouse button: the profile's, else the global map's,
+    with the active ``layer`` over both."""
+    return spacemouse_effective_buttons(layer).get(str(index))
+
+def spacemouse_bound_buttons():
+    """Every button Turnpad acts on with the current profile: in the base map or in
+    any of the layers (those are hidden from other programs with hide_buttons)."""
+    bound = {int(key) for key, binding in spacemouse_effective_buttons().items() if spacemouse_binds(binding)}
+    for layer in spacemouse_layer_maps():
+        bound.update(int(key) for key, binding in spacemouse_effective_buttons(layer).items() if spacemouse_binds(binding))
+    return bound
+
+def spacemouse_source():
+    """The connected SpaceMouse source of the input loop, if any."""
+    return next(
+        (source for source in globals().get("input_sources", []) if source.name == "spacemouse" and source.connected),
+        None,
+    )
 
 def spacemouse_action_keys(action):
     """The virtual keyboard keys a modifier or key_hold action holds, in press order."""
@@ -2658,7 +2978,7 @@ def spacemouse_action_keys(action):
 def run_spacemouse_action(action):
     """Run one SpaceMouse action (a modifier is held by the input loop)."""
     kind = action.type
-    if kind == "macro":
+    if kind in ("macro", "app"):
         steps = action.steps()
         if steps:
             enqueue_action(lambda: execute_config_macro(steps))
@@ -2675,6 +2995,61 @@ def run_spacemouse_action(action):
         tap_center()
     elif kind == "back":
         go_back()
+
+def control_button_action(index, layer=""):
+    """The press action Control's ``button:INDEX`` runs: the effective binding's
+    press (in the active ``layer``), unless it only holds keys or leaves the button
+    alone; a hold layer has no button to hold."""
+    binding = spacemouse_binding(index, layer)
+    action = binding.press if binding is not None else None
+    if action is None or action.type in ("none", "modifier", "key_hold"):
+        return None
+    if action.type == "layer" and action.layer_mode in (None, "hold"):
+        return None
+    return action
+
+def apply_control(command):
+    """Run one parsed Control command (dialpad_dbus.parse_control) on the input
+    loop, where the SpaceMouse buttons run their actions."""
+    verb, argument = command
+    if verb == "toggle":
+        toggle_top_right_icon(dialpad)
+    elif verb == "dial-on":
+        if not dialpad:
+            toggle_top_right_icon(dialpad)
+    elif verb == "dial-off":
+        if dialpad:
+            toggle_top_right_icon(dialpad)
+    elif verb == "rotate":
+        if dialpad:
+            for _ in range(abs(argument)):
+                rotate_dial("clockwise" if argument > 0 else "counterclockwise")
+    elif verb == "select":
+        tap_center()
+    elif verb == "back":
+        go_back()
+    elif verb == "function":
+        if not dialpad:
+            toggle_top_right_icon(dialpad)
+        enter_named_function(slot=argument)
+    elif verb == "function-title":
+        if not dialpad:
+            toggle_top_right_icon(dialpad)
+        enter_named_function(argument)
+    elif verb == "group":
+        if not dialpad:
+            toggle_top_right_icon(dialpad)
+        open_group_list(argument)
+    elif verb == "button":
+        source = spacemouse_source()
+        action = control_button_action(argument, source.layers.active if source is not None else "")
+        if action is not None:
+            if action.type in ("layer", "motion"):
+                # Their state lives in the SpaceMouse source.
+                if source is not None:
+                    source.run_state_action(argument, action)
+            else:
+                run_spacemouse_action(action)
 
 window_binary = None
 
@@ -3183,6 +3558,7 @@ def reconcile_spacemouse_keys():
             spacemouse_applied_keys.remove(key)
         set_keys_held(press, True)
         spacemouse_applied_keys.extend(press)
+    publish_driver_state()
 
 def restore_spacenav_leftovers(client, restore):
     """Undo what a run that was killed left in spacenavd: other programs muted
@@ -3199,6 +3575,19 @@ def restore_spacenav_leftovers(client, restore):
             client.set_button_map(int(button), int(mapped))
         except (TypeError, ValueError):
             pass
+    motion = saved.get("motion")
+    if isinstance(motion, dict):
+        try:
+            sens = float(motion["sens"])
+            axis = [float(value) for value in motion["axis"]]
+            invert = [bool(value) for value in motion["invert"]]
+        except (KeyError, TypeError, ValueError):
+            sens = None
+        if sens is not None and len(axis) == 6 and len(invert) == 6:
+            client.set_sensitivity(sens)
+            client.set_axis_sensitivity(axis)
+            client.set_invert(invert)
+            log.info("SpaceMouse: restored spacenavd's motion settings")
     restore.clear()
 
 def restore_spacenav_at_start():
@@ -3473,6 +3862,13 @@ class SpaceMouseSource(InputSource):
         self.deferred_buttons = set()
         self.last_slice = None
         self.last_pointer_angle = None
+        # Button layers, and the cap's motion in spacenavd (see sync_motion()).
+        self.layers = LayerState()
+        self.layer_key = None
+        self.motion_sessions = {}
+        self.motion_original = None
+        self.motion_applied = None
+        self.motion_shown = {"sensitivity": 1.0, "rotation": True, "translation": True}
         center.settled.append(self.center_settled)
         log.info("SpaceMouse mode: looking for spacenavd")
 
@@ -3553,7 +3949,7 @@ class SpaceMouseSource(InputSource):
             return
         wanted = set()
         if gui_config.spacemouse.hide_buttons:
-            wanted = {int(key) for key, binding in spacemouse_effective_buttons().items() if spacemouse_binds(binding)}
+            wanted = spacemouse_bound_buttons()
         # A button that is down now keeps its mapping until it is up: changing it
         # mid-press would leave the press or the release with the wrong client.
         self.deferred_buttons = {
@@ -3582,6 +3978,8 @@ class SpaceMouseSource(InputSource):
             data["sensitivity"] = self.saved_sensitivity
         if self.hidden:
             data["bnmap"] = {str(button): mapped for button, mapped in self.hidden.items()}
+        if self.motion_original is not None:
+            data["motion"] = self.motion_original
         if data:
             self.restore.save(data)
         else:
@@ -3603,6 +4001,105 @@ class SpaceMouseSource(InputSource):
         self.muted = False
         self.saved_sensitivity = None
         self.save_restore()
+
+    # --- the cap's motion for other programs -------------------------------------
+
+    def motion_base(self):
+        """The configured motion of the current profile, before the session's changes."""
+        return effective_motion(gui_config.spacemouse.motion, profile_meta().get("spacemouse_motion"))
+
+    def motion_target(self):
+        base = self.motion_base()
+        session = self.motion_sessions.get(app_name or "")
+        return session.apply(base) if session is not None else base
+
+    def motion_action(self, action):
+        """A motion button: change the session of the focused application."""
+        if gui_config is None or effective_motion is None:
+            return
+        session = self.motion_sessions.setdefault(app_name or "", MotionSession())
+        session.act(action.motion, self.motion_base())
+
+    def read_motion(self):
+        """What spacenavd has now (its own configuration), or None."""
+        # Muted, the global sensitivity is 0: the value to give back is the saved one.
+        sens = self.saved_sensitivity if self.muted else self.client.get_sensitivity()
+        axis = self.client.get_axis_sensitivity()
+        invert = self.client.get_invert()
+        if sens is None or axis is None or invert is None:
+            return None
+        return {"sens": sens, "axis": axis, "invert": [1 if flag else 0 for flag in invert]}
+
+    def push_motion(self, sens, axis, invert):
+        """Set spacenavd's sensitivity, axis sensitivities and inversion; True when it took all."""
+        if self.muted:
+            # The other programs stay silent: the value to give back at unmute is the new one.
+            self.saved_sensitivity = sens
+            self.save_restore()
+            done = True
+        else:
+            done = self.client.set_sensitivity(sens)
+        done = self.client.set_axis_sensitivity(axis) and done
+        return self.client.set_invert(invert) and done
+
+    def sync_motion(self):
+        """Make spacenavd's motion settings those of the focused application
+        (profile over the global motion, then the session's changes). Nothing
+        is touched while the effective motion is spacenavd's own; before the
+        first change its values go into the restore file, and they are given
+        back when the motion is neutral again, on exit and at the next start."""
+        if self.client.proto < 1 or gui_config is None or effective_motion is None:
+            return
+        target = self.motion_target()
+        self.motion_shown = {
+            "sensitivity": round(target["sensitivity"], 2),
+            "rotation": target["rotation"],
+            "translation": target["translation"],
+        }
+        if target == self.motion_applied:
+            return
+        # Whatever happens, this target is not tried again until something changes.
+        self.motion_applied = target
+        neutral = motion_neutral(target)
+        if self.motion_original is None:
+            if neutral:
+                return
+            original = self.read_motion()
+            if original is None:
+                log.warning("spacenavd did not tell its motion settings; leaving them alone")
+                return
+            self.motion_original = original
+            self.save_restore()
+        sens, axis, invert = motion_values(self.motion_original, target)
+        done = self.push_motion(sens, axis, invert)
+        if neutral and done:
+            self.motion_original = None
+            self.save_restore()
+        elif not done:
+            log.warning("spacenavd refused part of the motion settings")
+
+    def restore_motion(self):
+        """Give spacenavd its own motion settings back; True when it took them."""
+        original = self.motion_original
+        if original is None:
+            return True
+        done = self.client.set_sensitivity(original["sens"])
+        done = self.client.set_axis_sensitivity(original["axis"]) and done
+        return self.client.set_invert(original["invert"]) and done
+
+    # --- layers ---------------------------------------------------------------------
+
+    def layer_action(self, index, action):
+        """A layer button that is not a hold (a hold goes through the button machine)."""
+        if action.layer and action.layer_mode in ("latch", "toggle"):
+            self.layers.activate(index, action.layer, action.layer_mode)
+
+    def run_state_action(self, index, action):
+        """Layer and motion actions that Control's ``button:INDEX`` triggers."""
+        if action.type == "layer":
+            self.layer_action(index, action)
+        elif action.type == "motion":
+            self.motion_action(action)
 
     def context_changed(self):
         self.rotation.reset()
@@ -3637,6 +4134,9 @@ class SpaceMouseSource(InputSource):
     def run_buttons(self, actions):
         for item in actions:
             if item.kind == "action":
+                if item.action.type in ("layer", "motion"):
+                    self.run_state_action(item.index, item.action)
+                    continue
                 run_spacemouse_action(item.action)
                 if item.action.type in ("select", "back"):
                     self.buttons.clear_opener()
@@ -3644,6 +4144,10 @@ class SpaceMouseSource(InputSource):
                 self.hold_key(item.action, True)
             elif item.kind == "hold_up":
                 self.hold_key(item.action, False)
+            elif item.kind == "layer_down":
+                self.layers.hold_down(item.index, item.action.layer)
+            elif item.kind == "layer_up":
+                self.layers.hold_up(item.index)
             elif item.kind == "select":
                 tap_center()
             elif item.kind == "close":
@@ -3663,7 +4167,12 @@ class SpaceMouseSource(InputSource):
                 # A mapping change that waited for this button to come up.
                 self.hidden_for = None
         if pressed:
-            binding = spacemouse_binding(index)
+            # The button that switched a latch or toggle layer on switches it off again.
+            if self.layers.preempt(index):
+                return
+            binding = spacemouse_binding(index, self.layers.active)
+            # A latched layer is for this one press.
+            self.layers.consume()
             if binding is None:
                 return
             self.run_buttons(self.buttons.press(index, now, binding, dial_on))
@@ -3759,15 +4268,27 @@ class SpaceMouseSource(InputSource):
         if not dial_on:
             self.buttons.dial_off()
         # The profile (focus) or the configuration changed: hide what it binds.
-        buttons_key = (app_name, id(gui_config), id(profile_meta().get("spacemouse_buttons")))
+        meta = profile_meta()
+        buttons_key = (
+            app_name, id(gui_config), id(meta.get("spacemouse_buttons")), id(meta.get("spacemouse_layers")),
+        )
         if buttons_key != self.hidden_for:
             self.hidden_for = buttons_key
             self.sync_hidden_buttons()
-        if self.client.proto >= 1 and self.settings.mute_others:
-            if dial_on and not self.muted:
+        # Another profile (or context) or a new configuration: a latched or toggled layer ends.
+        layer_key = (id(gui_config), id(meta) if meta else 0)
+        if layer_key != self.layer_key:
+            if self.layer_key is not None:
+                self.layers.clear_sticky()
+            self.layer_key = layer_key
+        if self.client.proto >= 1:
+            # While the dial is on (with mute_others) or a Control "mute:MS" lease runs.
+            wanted = spacemouse_mute.wanted(dial_on, self.settings.mute_others, time())
+            if wanted and not self.muted:
                 self.mute()
-            elif not dial_on and self.muted:
+            elif not wanted and self.muted:
                 self.unmute()
+            self.sync_motion()
 
     def release_keys(self, queued=False):
         """Let go of the modifier keys the buttons hold. ``queued``: through the
@@ -3786,6 +4307,10 @@ class SpaceMouseSource(InputSource):
         self.saved_sensitivity = None
         self.hidden = {}
         self.hidden_for = None
+        # What was changed in spacenavd stays in the restore file for the next connection.
+        self.motion_original = None
+        self.motion_applied = None
+        self.layers.clear()
         self.held_counts = {}
         self.physical_down = set()
         self.deferred_buttons = set()
@@ -3799,6 +4324,8 @@ class SpaceMouseSource(InputSource):
             try:
                 if self.muted:
                     self.unmute()
+                if self.restore_motion():
+                    self.motion_original = None
                 # What cannot be given back stays in the restore file for the next start.
                 self.hidden = {
                     button: mapped for button, mapped in self.hidden.items()
@@ -4221,9 +4748,20 @@ def pad_to_minimum(arr, minimum):
         arr = []
     return arr + [None] * max(0, minimum - len(arr))
 
+def select_profile_context(window_binary_local, shortcuts):
+    """(context name, shortcuts) in force for the profile ``shortcuts``: its first
+    context that matches the window's title (a pushed one, else the polled one) and
+    the mode the linked application reports; the plain profile when none does."""
+    if shortcuts_for_context is None or not isinstance(shortcuts, dict) or not shortcuts.get("_contexts"):
+        return "", shortcuts
+    window_title_now = pushed_window_title if pushed_window_title is not None else window_title
+    link = app_link
+    mode = link.context_for(window_binary_local).get("mode", "") if link is not None else ""
+    return shortcuts_for_context(shortcuts, window_title_now, mode)
+
 def window_was_changed(window_binary_local, force=False):
     global stop_threads, window_binary, window_title, app_name, app_specific_shortcuts, multi_app_mode, multi_app_mode_titles, multi_app_mode_icons,\
-        center_activated, title
+        center_activated, title, context_name
 
     # GNOME's fallback window query exposes a title but no application id.
     # Once the Shell extension has supplied an id over D-Bus, treating that
@@ -4233,11 +4771,13 @@ def window_was_changed(window_binary_local, force=False):
         return
 
     app_name_local, app_specific_shortcuts = get_appropriate_app_name_and_shortcuts(window_binary_local, window_title)
+    context_local, app_specific_shortcuts = select_profile_context(window_binary_local, app_specific_shortcuts)
     multi_app_mode_local, multi_app_mode_titles_local, multi_app_mode_icons_local = is_multifunction(app_specific_shortcuts)
 
     update = False
 
-    if window_binary_local != window_binary:
+    focus_changed = window_binary_local != window_binary
+    if focus_changed:
         window_binary = window_binary_local
         update = True
 
@@ -4245,6 +4785,16 @@ def window_was_changed(window_binary_local, force=False):
     if app_name_changed:
         app_name = app_name_local
         update = True
+
+    # A context of the same profile changes the buttons and what DriverState
+    # says; the dial starts again only when its menu differs (checked below).
+    if context_local != context_name:
+        context_name = context_local
+        log.info("Profile context: %s", context_local or "(none)")
+        publish_driver_state()
+
+    if focus_changed and not force and app_name_local == "none" and window_binary_local:
+        suggest_profile(window_binary_local)
 
     if multi_app_mode_local != multi_app_mode:
         multi_app_mode = multi_app_mode_local
@@ -4400,6 +4950,7 @@ def cleanup():
         if fd_t is not None:
             fd_t.close()
         stop_kwin_script()
+        stop_app_link()
         for source in input_sources:
             try:
                 source.close()
@@ -4714,6 +5265,35 @@ def on_window_activated(event):
     except Exception:
         pass
         
+def accessibility_bus_reachable(timeout_ms=500):
+    """Whether the accessibility bus answers. pyatspi aborts the whole process
+    (a GLib error, not an exception) when it cannot reach that bus, e.g. when
+    at-spi-bus-launcher's bus is gone, so it is asked first: the address from
+    AT_SPI_BUS_ADDRESS or org.a11y.Bus, then a connection to it."""
+    try:
+        from gi.repository import Gio, GLib
+
+        address = os.environ.get("AT_SPI_BUS_ADDRESS", "")
+        if not address:
+            # Own connections: the shared session bus exits the process when it goes away.
+            flags = Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT | Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION
+            session_address = Gio.dbus_address_get_for_bus_sync(Gio.BusType.SESSION, None)
+            session = Gio.DBusConnection.new_for_address_sync(session_address, flags, None, None)
+            try:
+                reply = session.call_sync(
+                    "org.a11y.Bus", "/org/a11y/bus", "org.a11y.Bus", "GetAddress", None,
+                    GLib.VariantType("(s)"), Gio.DBusCallFlags.NONE, timeout_ms, None,
+                )
+                address = reply.unpack()[0]
+            finally:
+                session.close_sync(None)
+        flags = Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT | Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION
+        Gio.DBusConnection.new_for_address_sync(address, flags, None, None).close_sync(None)
+        return True
+    except Exception as error:
+        log.info("Accessibility bus not reachable, focused windows are found another way: %s", error)
+        return False
+
 def check_window_pyatspi():
     pyatspi.Registry.registerEventListener(
         on_window_activated,
@@ -4733,6 +5313,7 @@ try:
 
     # D-Bus startup runs independently so an unavailable session bus cannot delay the driver.
     init_dbus()
+    start_app_link()
 
     # The keyboard brightness key also dims or brightens the DialPad light;
     # changes arrive in the D-Bus service's main loop.
@@ -4813,7 +5394,8 @@ try:
 
     desktop_by_pyatspi = None
     try:
-        desktop_by_pyatspi = pyatspi.Registry.getDesktop(0)
+        if PYATSPI_AVAILABLE and accessibility_bus_reachable():
+            desktop_by_pyatspi = pyatspi.Registry.getDesktop(0)
     except:
         pass
 

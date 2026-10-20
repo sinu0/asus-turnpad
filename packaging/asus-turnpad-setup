@@ -10,6 +10,7 @@ set -u
 
 SERVICE="asus-turnpad.service"
 OVERLAY_SERVICE="asus-turnpad-overlay.service"
+SCREEN_SERVICE="asus-turnpad-screen.service"
 GNOME_EXTENSION_UUID="asus-turnpad@sinu0.github.io"
 
 if [[ $(id -u) == 0 ]]; then
@@ -87,6 +88,15 @@ elif [[ "${XDG_SESSION_TYPE:-}" == wayland ]]; then
 else
     echo "Not a Wayland session: the driver works, the on-screen dial needs GNOME Shell 45 or newer or a Wayland desktop with layer-shell (KDE Plasma 6, Hyprland, sway, niri, COSMIC)."
 fi
+
+# The screen of a SpacePilot Pro (USB 046d:c629): the udev rule starts its unit
+# on plugging in, so one that is already plugged in needs the start by hand.
+for DEVICE in /sys/bus/usb/devices/*; do
+    if [[ "$(cat "$DEVICE/idVendor" 2>/dev/null)" == 046d && "$(cat "$DEVICE/idProduct" 2>/dev/null)" == c629 ]]; then
+        systemctl --user start "$SCREEN_SERVICE" >/dev/null 2>&1 || true
+        break
+    fi
+done
 
 echo
 if (( RELOGIN )); then

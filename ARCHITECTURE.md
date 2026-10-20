@@ -3,15 +3,17 @@
 Turnpad is a set of separately running parts that talk over the session D-Bus and share one JSON file. Only the outer layer depends on the desktop.
 
 ```
- touchpad (evdev) ─► dialpad.py ──────────► uinput keys, scroll, media keys
-                      │   ▲   ▲
-     focused window ──┘   │   └── config.json  ◄── config_app/ (settings, GTK4)
-     desktop/active_window│                         │
-                          │                         │ ReloadConfig
-                 dialpad_dbus.py  ◄─────────────────┘
-                          │  OverlayState / OverlayDetails signals
-                          ▼
-          on-screen dial frontend (per desktop)
+ touchpad (evdev) ──────┐
+ mouse (evdev) ─────────┼─► dialpad.py ──────► uinput keys, scroll, media keys
+ SpaceMouse (spacenavd)─┘    │   ▲   ▲   ▲
+                             │   │   │   └── app link socket ◄── add-on in Blender
+     focused window ─────────┘   │   └── config.json  ◄── config_app/ (settings, GTK4)
+     desktop/active_window       │                         │
+                          dialpad_dbus.py  ◄───────────────┘ ReloadConfig
+                             │  OverlayState / OverlayDetails / DriverState signals
+                             ├──────────────────────────────┐
+                             ▼                              ▼
+          on-screen dial frontend (per desktop)     screen/ (SpacePilot Pro, USB)
           · GNOME: gnome/extension/ (dial.js)
           · layer-shell compositors: overlay/layer_shell.py (painter.py)
           · X11: dialpad_ui.py (legacy window)
@@ -20,15 +22,29 @@ Turnpad is a set of separately running parts that talk over the session D-Bus an
 | Part | Desktop-specific? | Where |
 |---|---|---|
 | Touch input, gestures, actions | No | `dialpad.py`, `dial_gesture.py` |
+| Mouse-only mode (the mouse as the dial) | No (evdev) | `mouse_dial.py` (pure state machines), `MouseSource` in `dialpad.py` |
+| SpaceMouse mode | No | `spacemouse_dial.py` (pure: buttons, layers, cap axes, motion), `spacenav_client.py` (spacenavd's socket protocol, standard library only), `spacemouse_devices.py` (the device's physical keys and raw indexes), `SpaceMouseSource` in `dialpad.py`; the settings page is `config_app/spacemouse*.py` |
+| Application link, profile offers | No (Unix socket, D-Bus) | `app_link.py` (the driver is the server; add-on for Blender in `integrations/blender/turnpad/`), `app_suggest.py`, `desktop/notifications.py` |
 | Configuration model, presets, skins | No | `config/` |
 | D-Bus service | No (session bus) | `dialpad_dbus.py` |
 | Settings app | No (GTK4 runs everywhere) | `config_app/` |
+| What hardware the settings app sees and offers (setup assistant, pages that fit, key capture, mice list) | No (reads `/proc` and sysfs) | `config_app/hardware.py` (pure, unit tested), `config_app/key_capture.py`, `config_app/device_dialogs.py` |
+| Contexts, macro recorder, `--add-profile` | No | `config_app/contexts.py` + `context_dialogs.py`, `recorder.py` + `recorder_dialog.py`, `commandline.py` |
 | Focused application | **Yes**, one backend each; KDE Plasma pushes it from a KWin script | `desktop/active_window.py`, `desktop/kwin_script.py` |
 | Light/dark preference | No (XDG portal, gsettings fallback) | `desktop/color_scheme.py` |
 | On-screen dial | **Yes**, one frontend each | `gnome/extension/`, `overlay/layer_shell.py`, `dialpad_ui.py` |
 | What the dial shows, where and when | No (pure Python twins of the JavaScript) | `overlay/look.py`, `overlay/visibility.py` |
 | Dial painting | No (Cairo) | `gnome/extension/dial.js`, `overlay/painter.py` |
 | Installing the frontend | **Yes**, one case each | `install_overlay.sh` |
+| SpaceMouse screen (SpacePilot Pro) | No (own process, USB) | `screen/` (`service.py`; pages in `pages.py` painted with Cairo, behaviour in `ui.py`, USB in `device.py`) |
+
+## SpaceMouse and the application link
+
+SpaceMouse mode reads the device through `spacenavd`: `spacenav_client.py` speaks its socket protocol (raw axes and buttons, which arrive before the daemon's dead zones and button map; a few requests change the cap's sensitivity for muting, per-application motion and hidden buttons). Whatever it changes is written to `~/.config/asus-turnpad/spacenav-restore.json` first and given back on exit and at the next start, so a crash leaves nothing behind. `spacemouse_dial.py` has no hardware imports: `ButtonMachine` turns raw button events into press and hold actions, `LayerState` keeps the active button layer, `SpaceCap` turns raw axes into a tilt angle, a twist and a push. `SpaceMouseSource` in `dialpad.py` runs them in the same input loop as the mouse (`listen_input_sources()`) and calls the state functions the touch loop uses, so a menu, a list or a function behaves the same with any input.
+
+The application link (`app_link.py`, a thread of the driver) is a Unix socket in the runtime directory that add-ons connect to (today the Blender add-on). Add-ons send their command catalog and mode; the driver sends only `run` for an id from that catalog and never executes anything it receives. `GetAppCommands` and `DriverState` give the settings app and the screen the catalog and the mode; profile contexts (`select_profile_context()`) switch menus and buttons by window title or mode. `app_suggest.py` offers a ready profile for an application without one, as a notification from `desktop/notifications.py` whose button starts the settings app with `--add-profile`.
+
+Programs that only follow or steer the driver (the screen service, a script) use the D-Bus signal `DriverState` and the `Control` method; the contract is in `AGENTS.md`.
 
 ## Names and identifiers
 
@@ -58,7 +74,7 @@ It returns `(binary path, title)` or raises. Backends are tried in registration 
 
 A frontend is a transparent, click-through window or layer above all others that does three things:
 
-1. Subscribes to `OverlayState` and `OverlayDetails` on `io.github.sinu0.AsusTurnpad.Driver`. Call `GetOverlayDetails()` once at start. The signal contract is in `AGENTS.md`.
+1. Subscribes to `OverlayState` and `OverlayDetails` (programs that follow the driver rather than draw its dial, like the SpaceMouse screen, also use `DriverState`, `GetDriverState()` and `Control()`) on `io.github.sinu0.AsusTurnpad.Driver`. Call `GetOverlayDetails()` once at start. The signal contract is in `AGENTS.md`.
 2. Reads the `overlay` section of `~/.config/asus-turnpad/config.json` (scale, position, hide delay, hints, pointer, accent, skin, skin_light, follow_system_style) and reloads it when the file changes. Position `pointer` needs the pointer's position when the dial appears; `overlayPlacement()` / `overlay.look.overlay_placement()` take it and fall back to `lower` without it.
 3. Paints with `overlay.painter.paint_dial()` (Python and Cairo; icons through `overlay.gtk_icons.draw_icon` in GTK) or with `gnome/extension/dial.js` (GJS). Skins then work without extra code.
 
@@ -122,3 +138,7 @@ The GNOME extension therefore paints in three layers that the compositor puts to
 A group's list is one more actor beside the dial, painted by `paintSubmenu()` only when the list, its highlight or the skin changes; it is a child of the dial, so it fades and hides with it.
 
 The layer-shell frontend has the same three layers (`DialLayers` in `overlay/frontend.py`) and repaints its list window only when `submenuKey()`, the list's scale or its size change. The overlay actor (or layer surface) is only as large as the dial, so its fade does not composite the whole screen. The driver sends the finger angle in `POINTER_STEP_DEGREES` steps (at most once per touch frame). `paintDial()` remains the one-call version for the README pictures and produces the same pixels.
+
+## SpaceMouse screen
+
+`screen/service.py` is a separate user service (`asus-turnpad-screen.service`, started by udev when a SpacePilot Pro is plugged in) that draws Turnpad on the device's 320×240 colour screen. It reads the driver like the layer-shell dial does (`OverlayState`, `OverlayDetails`, `DriverState`; `Control` carries what the screen's OK, Up and Down keys do), watches `config.json`, listens to spacenavd as one more client (raw buttons and axes; it changes nothing there) and writes frames through pyusb (`screen/device.py`, interface 0 only). Painting (`pages.py`) and behaviour (`ui.py`, `content.py`) are pure, so the settings app renders the same pages with `screen.preview.render()`. It works without the driver (configuration only). Exit status 3 means nothing to do (switched off, no pyusb, no screen); the unit is not restarted then.

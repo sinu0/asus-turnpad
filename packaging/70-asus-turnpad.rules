@@ -11,3 +11,8 @@ ACTION!="remove", SUBSYSTEM=="i2c-dev", KERNEL=="i2c-[0-9]*", TAG+="uaccess", GR
 # hidraw of the touchpads the driver recognises (ASCE, ASCF, ASCP, ASUE, ASUF,
 # ASUP, ELAN, see PORTING.md): switching the DialPad and its light.
 ACTION!="remove", SUBSYSTEM=="hidraw", KERNELS=="i2c-ASCE*|i2c-ASCF*|i2c-ASCP*|i2c-ASUE*|i2c-ASUF*|i2c-ASUP*|i2c-ELAN*", TAG+="uaccess", GROUP="i2c", MODE="0660"
+
+# The screen of a 3Dconnexion SpacePilot Pro (046d:c629, USB interface 0, no
+# kernel driver): the logged-in user may open it, and the user's service
+# manager starts the screen service while the device is present.
+ACTION!="remove", SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="046d", ATTR{idProduct}=="c629", TAG+="uaccess", TAG+="systemd", ENV{SYSTEMD_USER_WANTS}+="asus-turnpad-screen.service"

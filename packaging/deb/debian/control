@@ -28,11 +28,16 @@ Recommends:
  gir1.2-rsvg-2.0,
  gnome-shell,
  gir1.2-gtk4layershell-1.0,
-Description: Touchpad dial for ASUS laptops with a DialPad
- Turnpad turns the DialPad of ASUS laptops into a dial: a radial menu of
+ python3-usb,
+Description: Dial for ASUS DialPads, any touchpad, a mouse or a 3Dconnexion SpaceMouse
+ Turnpad turns the DialPad of ASUS laptops, any other touchpad, a mouse
+ with a wheel or a 3Dconnexion SpaceMouse into a dial: a radial menu of
  functions, profiles per application, actions on turning and tapping, and an
  on-screen dial for GNOME Shell 45 or newer and for Wayland compositors with
  layer-shell (KDE Plasma 6, Hyprland, sway, niri, COSMIC).
+ .
+ A SpaceMouse needs spacenavd (not installed by this package); the colour
+ screen of a SpacePilot Pro is drawn when python3-usb is installed.
  .
  After installing, each user who wants the dial runs asus-turnpad-setup once
  and logs out and back in.

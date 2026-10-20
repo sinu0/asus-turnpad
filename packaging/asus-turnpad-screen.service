@@ -1,0 +1,26 @@
+# The screen of a SpacePilot Pro, for distribution packages; install.sh
+# writes its own unit from asus-turnpad-screen.service in the repository
+# root. Started by the udev rule of the device (70-asus-turnpad.rules,
+# SYSTEMD_USER_WANTS) when it is plugged in, so there is no [Install] section
+# and asus-turnpad-setup has nothing to enable.
+
+[Unit]
+Description=Turnpad on the SpaceMouse screen
+# Not for the user managers of display managers (gdm, sddm greeters are system
+# users): they must not take the screen away from the person who logs in.
+ConditionUser=!@system
+StartLimitBurst=20
+StartLimitIntervalSec=300
+
+[Service]
+Type=simple
+# The service drives the screen over USB and needs no privileges; it can never
+# gain any (sudo, pkexec and other setuid helpers fail), even with passwordless sudo.
+NoNewPrivileges=yes
+ExecStart=/usr/bin/python3 /usr/share/asus-turnpad/screen/service.py
+TimeoutSec=5
+Restart=on-failure
+RestartSec=2
+# Exit status 3: no supported screen, pyusb is missing or the screen is
+# switched off in the settings, so starting again would not help.
+RestartPreventExitStatus=3

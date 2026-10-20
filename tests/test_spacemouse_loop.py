@@ -23,13 +23,15 @@ import spacenav_client as proto  # noqa: E402
 import test_driver_state  # noqa: E402
 from config.schema import (  # noqa: E402
     MODIFIER_KEYS, DialPadConfig, Profile, SpaceMouseAction, SpaceMouseButton, SpaceMouseConfig,
-    spacemouse_binds, spacemouse_buttons_for,
+    effective_motion, merge_spacemouse_buttons, merge_spacemouse_layers, spacemouse_binds, spacemouse_buttons_for,
 )
 from dial_gesture import RotationTracker, scroll_acceleration_multiplier, slice_index  # noqa: E402
 import threading as _threading  # noqa: E402
 from fake_spacenavd import FakeSpacenavd  # noqa: E402
 from mouse_dial import MouseDial, MousePointer  # noqa: E402
-from spacemouse_dial import ButtonMachine, ListStepper, SpaceCap  # noqa: E402
+from spacemouse_dial import (  # noqa: E402
+    ButtonMachine, LayerState, ListStepper, MotionSession, MuteLease, SpaceCap, motion_neutral, motion_values,
+)
 from test_driver_state import last_state  # noqa: E402
 from test_mouse_dial import FakeFile, FakeMouse  # noqa: E402
 
@@ -95,7 +97,10 @@ def load_driver(shortcuts, gui_config, restore_file):
         log=type("Log", (), {"info": noop, "debug": noop, "warning": noop, "error": noop, "exception": noop})(),
         time=lambda: state.clock, sleep=tick,
         select=types.SimpleNamespace(select=select_),
-        gui_config=gui_config, SCHEMA_MODIFIER_KEYS=MODIFIER_KEYS, spacemouse_buttons_for=spacemouse_buttons_for, spacemouse_binds=spacemouse_binds,
+        gui_config=gui_config, SCHEMA_MODIFIER_KEYS=MODIFIER_KEYS, spacemouse_buttons_for=spacemouse_buttons_for, merge_spacemouse_buttons=merge_spacemouse_buttons,
+        spacemouse_binds=spacemouse_binds, merge_spacemouse_layers=merge_spacemouse_layers,
+        effective_motion=effective_motion, LayerState=LayerState, MotionSession=MotionSession,
+        motion_neutral=motion_neutral, motion_values=motion_values,
         SPACENAV_RESTORE_FILE=restore_file, SPACENAV_UNUSED_BUTTON=63,
         SpacenavClient=proto.SpacenavClient, RestoreFile=proto.RestoreFile, # Never the real spacenavd of this computer: only the socket the test names.
         socket_candidates=lambda configured, _environ, _rc: [configured],
@@ -104,7 +109,7 @@ def load_driver(shortcuts, gui_config, restore_file):
         UEV_MOTION=proto.UEV_MOTION, UEV_PRESS=proto.UEV_PRESS, UEV_RELEASE=proto.UEV_RELEASE,
         UEV_RAWAXIS=proto.UEV_RAWAXIS, UEV_RAWBUTTON=proto.UEV_RAWBUTTON,
         MouseDial=MouseDial, MousePointer=MousePointer, RotationTracker=RotationTracker, SpaceCap=SpaceCap,
-        ButtonMachine=ButtonMachine, ListStepper=ListStepper, slice_index=slice_index,
+        ButtonMachine=ButtonMachine, ListStepper=ListStepper, slice_index=slice_index, spacemouse_mute=MuteLease(),
         scroll_acceleration_multiplier=scroll_acceleration_multiplier, SCROLL_TRIGGER_DEGREES=15,
         default_treshold=90, socket_send_progress_above_treshold=120, SUBMENU_STEP_DEGREES=30,
         angle_hysteresis=3, center_hold_time=0.5, last_event_time=0, treshold=None,
@@ -221,6 +226,7 @@ class ActionTest(unittest.TestCase):
         self.toggled = []
         self.driver["gui_config"] = None
         self.driver["spacemouse_buttons_for"] = None
+        self.driver["merge_spacemouse_buttons"] = None
 
         def toggle(current):
             self.toggled.append(current)
@@ -318,6 +324,30 @@ class ActionTest(unittest.TestCase):
         while self.queued:
             self.queued.pop(0)()
 
+    def test_label_only_entries_keep_the_binding_below(self):
+        self.prepare("org.kde.krita.desktop")
+        config = DialPadConfig()
+        config.spacemouse.buttons = {"5": SpaceMouseButton(press=SpaceMouseAction("dial"))}
+        self.driver["gui_config"] = config
+        self.driver["spacemouse_buttons_for"] = spacemouse_buttons_for
+        self.driver["merge_spacemouse_buttons"] = merge_spacemouse_buttons
+        self.driver["app_specific_shortcuts"]["_meta"]["spacemouse_buttons"] = {
+            "5": SpaceMouseButton(label="Dial"),
+            "6": SpaceMouseButton(label="Nothing below"),
+        }
+        effective = self.driver["spacemouse_effective_buttons"]()
+        self.assertEqual(effective["5"].press.type, "dial")
+        self.assertEqual(effective["5"].label, "Dial")
+        self.assertFalse(spacemouse_binds(effective["6"]))
+        # Labels change nothing about which buttons are bound (and hidden).
+        self.assertEqual({k for k, b in effective.items() if spacemouse_binds(b)}, {"5"})
+        # The global labels over the defaults keep the default actions, so key 1 still enters a function.
+        config.spacemouse.buttons = {"12": SpaceMouseButton(label="Extrude")}
+        self.driver["app_specific_shortcuts"]["_meta"]["spacemouse_buttons"] = {"13": SpaceMouseButton(label="Sculpt")}
+        self.assertEqual(self.driver["spacemouse_binding"](12).press.slot, 0)
+        self.assertEqual(self.driver["spacemouse_binding"](13).press.slot, 1)
+        self.assertEqual(self.driver["spacemouse_binding"](12).label, "Extrude")
+
     def test_binding_lookup_profile_over_global(self):
         self.prepare("org.kde.krita.desktop")
         config = DialPadConfig()
@@ -332,7 +362,8 @@ class ActionTest(unittest.TestCase):
         self.assertEqual(self.driver["spacemouse_binding"](5).press.type, "back")
         self.assertEqual(self.driver["spacemouse_binding"](6), None)
         config.spacemouse.buttons = {}
-        self.assertEqual(self.driver["spacemouse_binding"](17).press.type, "function")  # the default map
+        self.assertEqual(self.driver["spacemouse_binding"](12).press.slot, 0)  # the default map: short press, slot 0
+        self.assertEqual(self.driver["spacemouse_binding"](17).press.slot, 5)  # long press, slot 5
 
 
 class LoopTest(SpaceMouseTestCase):
@@ -441,7 +472,9 @@ class LoopTest(SpaceMouseTestCase):
     def test_list_tilt_steps_with_auto_repeat_and_the_group_button_releases_to_select(self):
         server = self.start_server()
         self.server = server
-        self.load(self.config(server), app="org.gnome.Nautilus.desktop")
+        # A button with a hold action (the default map has none: the device tells long presses itself).
+        group_button = SpaceMouseButton(press=SpaceMouseAction("function", slot=1), hold=SpaceMouseAction("group"))
+        self.load(self.config(server, buttons={"18": group_button}), app="org.gnome.Nautilus.desktop")
         self.run_steps(
             lambda: self.deliver(server, button(18, True)),
             *self.pump(10),  # the hold action (the first group) fires after 400 ms
@@ -461,8 +494,8 @@ class LoopTest(SpaceMouseTestCase):
     def test_function_button_enters_the_function_at_once(self):
         server = self.default_start()
         self.run_steps(
-            lambda: self.deliver(server, button(17, True)),
-            lambda: self.deliver(server, button(17, False)),  # tapped: the press action
+            lambda: self.deliver(server, button(12, True)),
+            lambda: self.deliver(server, button(12, False)),  # tapped: the press action
             lambda: None,
         )
         self.assertEqual((self.driver["dialpad"], self.driver["center_activated"], self.driver["title"]), (True, True, "Zoom"))
@@ -489,8 +522,8 @@ class LoopTest(SpaceMouseTestCase):
     def test_hold_of_the_push_goes_back(self):
         server = self.default_start()
         self.run_steps(
-            lambda: self.deliver(server, button(17, True)),
-            lambda: self.deliver(server, button(17, False)),
+            lambda: self.deliver(server, button(12, True)),
+            lambda: self.deliver(server, button(12, False)),
             lambda: self.deliver(server, axis(1, -300)),
             *self.pump(14),  # past the centre hold time (0.5 s)
             lambda: self.deliver(server, axis(1, 0)),
@@ -574,8 +607,8 @@ class LoopTest(SpaceMouseTestCase):
         self.load(self.config(server))
         self.run_steps(
             lambda: None,
-            lambda: self.deliver(server, proto.pack_event(proto.UEV_PRESS, 17)),
-            lambda: self.deliver(server, proto.pack_event(proto.UEV_RELEASE, 17)),
+            lambda: self.deliver(server, proto.pack_event(proto.UEV_PRESS, 12)),
+            lambda: self.deliver(server, proto.pack_event(proto.UEV_RELEASE, 12)),
             lambda: None,
         )
         self.assertEqual(self.source().client.proto, 0)
@@ -599,6 +632,70 @@ class LoopTest(SpaceMouseTestCase):
         self.run_steps(lambda: self.deliver(server, button(0, True)), *self.pump(2))
         self.assertTrue(self.driver["dialpad"])
         self.assertEqual(server.sensitivity, 1.0)
+
+    def test_a_mute_lease_silences_the_others_without_the_dial_even_when_not_muting(self):
+        server = self.default_start(mute_others=False)
+        lease = self.driver["spacemouse_mute"]
+        self.run_steps(
+            lambda: None,
+            lambda: lease.grant(3000, self.state.clock),  # Control "mute:3000"
+            lambda: None,
+            lambda: (
+                self.assertFalse(self.driver["dialpad"]),
+                self.assertEqual(server.sensitivity, 0.0),
+                self.assertTrue(self.source().muted),
+                self.assertEqual(proto.RestoreFile(self.restore_path).load(), {"sensitivity": 1.0}),
+            ),
+            lambda: setattr(self.state, "clock", self.state.clock + 2.0),  # renewed in time: still muted
+            lambda: lease.grant(3000, self.state.clock),
+            lambda: setattr(self.state, "clock", self.state.clock + 2.0),
+            lambda: None,
+            lambda: self.assertEqual(server.sensitivity, 0.0),
+            lambda: setattr(self.state, "clock", self.state.clock + 3.5),  # not renewed: it runs out
+            lambda: None,
+            lambda: None,
+            lambda: (
+                self.assertEqual(server.sensitivity, 1.0),
+                self.assertFalse(self.source().muted),
+                self.assertIsNone(proto.RestoreFile(self.restore_path).load()),
+            ),
+        )
+
+    def test_mute_zero_ends_the_lease_at_once(self):
+        server = self.default_start(mute_others=False)
+        lease = self.driver["spacemouse_mute"]
+        self.run_steps(
+            lambda: lease.grant(3000, self.state.clock),
+            lambda: None,
+            lambda: None,
+            lambda: self.assertEqual(server.sensitivity, 0.0),
+            lambda: lease.grant(0, self.state.clock),
+            lambda: None,
+            lambda: None,
+            lambda: self.assertEqual(server.sensitivity, 1.0),
+        )
+
+    def test_the_dial_and_a_lease_both_hold_the_mute(self):
+        server = self.default_start()
+        lease = self.driver["spacemouse_mute"]
+        self.run_steps(
+            lambda: lease.grant(3000, self.state.clock),
+            lambda: self.deliver(server, button(0, True)),  # the dial on
+            lambda: None,
+            lambda: lease.grant(0, self.state.clock),  # the lease ends, the dial is still on
+            lambda: None,
+            lambda: None,
+            lambda: (self.assertTrue(self.driver["dialpad"]), self.assertEqual(server.sensitivity, 0.0)),
+        )
+
+    def test_a_lease_given_back_with_the_cleanup(self):
+        server = self.default_start(mute_others=False)
+        lease = self.driver["spacemouse_mute"]
+        self.run_steps(lambda: lease.grant(3000, self.state.clock), *self.pump(3))
+        self.assertEqual(server.sensitivity, 0.0)
+        self.source().close()
+        self.assertEqual(server.sensitivity, 1.0)
+        self.assertIsNone(proto.RestoreFile(self.restore_path).load())
 
     def test_cleanup_gives_the_daemon_back(self):
         server = self.default_start()
@@ -1003,8 +1100,8 @@ class HoldKeysLoopTest(SpaceMouseTestCase):
     def test_a_profile_none_beats_the_global_binding(self):
         server = self.start(krita={"22": SpaceMouseButton(press=SpaceMouseAction("none"))})
         self.run_steps(
-            lambda: self.deliver(server, button(17, True)),   # enters the first function
-            lambda: self.deliver(server, button(17, False)),
+            lambda: self.deliver(server, button(12, True)),   # enters the first function
+            lambda: self.deliver(server, button(12, False)),
             lambda: self.deliver(server, button(22, True)),   # Esc is none here: no "back"
             lambda: self.deliver(server, button(22, False)),
             lambda: None,
@@ -1016,19 +1113,19 @@ class HoldKeysLoopTest(SpaceMouseTestCase):
         files_bind = {"4": SpaceMouseButton(press=SpaceMouseAction("macro", keys=["KEY_F5"]))}
         krita_bind = {"3": SpaceMouseButton(press=SpaceMouseAction("macro", keys=["KEY_F6"])),
                       "22": SpaceMouseButton(press=SpaceMouseAction("none")),
-                      "17": SpaceMouseButton(press=SpaceMouseAction("none"), hold=SpaceMouseAction("none"))}
+                      "12": SpaceMouseButton(press=SpaceMouseAction("none"), hold=SpaceMouseAction("none"))}
         server = self.start(krita=krita_bind, files=files_bind, hide_buttons=True)
-        default_bound = {0, 17, 18, 19, 20, 21, 22, 23, 24, 25}
+        default_bound = {0, *range(12, 28), 29, 30}
         hidden = lambda: {b for b, m in server.button_map.items() if m == 63}
         self.run_steps(
             lambda: None,
-            lambda: self.assertEqual(hidden(), (default_bound - {17, 22}) | {3}),  # Krita: none is not hidden
+            lambda: self.assertEqual(hidden(), (default_bound - {12, 22}) | {3}),  # Krita: none is not hidden
             lambda: self.driver["window_was_changed"]("org.gnome.Nautilus.desktop"),
             lambda: None,
             lambda: self.assertEqual(hidden(), default_bound | {4}),
             lambda: self.driver["window_was_changed"]("org.kde.krita.desktop"),
             lambda: None,
-            lambda: self.assertEqual(hidden(), (default_bound - {17, 22}) | {3}),
+            lambda: self.assertEqual(hidden(), (default_bound - {12, 22}) | {3}),
             lambda: self.assertEqual(server.button_map.get(4, 4), 4),  # Nautilus' button given back
             lambda: self.assertEqual(proto.RestoreFile(self.restore_path).load()["bnmap"]["3"], 3),
         )
