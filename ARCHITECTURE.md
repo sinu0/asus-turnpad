@@ -7,6 +7,7 @@ Turnpad is a set of separately running parts that talk over the session D-Bus an
  mouse (evdev) ─────────┼─► dialpad.py ──────► uinput keys, scroll, media keys
  SpaceMouse (spacenavd)─┘    │   ▲   ▲   ▲
                              │   │   │   └── app link socket ◄── add-on in Blender
+                             │   │                           ◄── bridges (integrations/) ◄─► SolidCraft control port
      focused window ─────────┘   │   └── config.json  ◄── config_app/ (settings, GTK4)
      desktop/active_window       │                         │
                           dialpad_dbus.py  ◄───────────────┘ ReloadConfig
@@ -24,7 +25,7 @@ Turnpad is a set of separately running parts that talk over the session D-Bus an
 | Touch input, gestures, actions | No | `dialpad.py`, `dial_gesture.py` |
 | Mouse-only mode (the mouse as the dial) | No (evdev) | `mouse_dial.py` (pure state machines), `MouseSource` in `dialpad.py` |
 | SpaceMouse mode | No | `spacemouse_dial.py` (pure: buttons, layers, cap axes, motion), `spacenav_client.py` (spacenavd's socket protocol, standard library only), `spacemouse_devices.py` (the device's physical keys and raw indexes), `SpaceMouseSource` in `dialpad.py`; the settings page is `config_app/spacemouse*.py` |
-| Application link, profile offers | No (Unix socket, D-Bus) | `app_link.py` (the driver is the server; add-on for Blender in `integrations/blender/turnpad/`), `app_suggest.py`, `desktop/notifications.py` |
+| Application link, profile offers | No (Unix socket, D-Bus) | `app_link.py` (the driver is the server; add-on for Blender in `integrations/blender/turnpad/`; bridges for applications with a control channel in `integrations/bridges.py`, SolidCraft in `integrations/solidcraft/`), `app_suggest.py`, `desktop/notifications.py` |
 | Configuration model, presets, skins | No | `config/` |
 | D-Bus service | No (session bus) | `dialpad_dbus.py` |
 | Settings app | No (GTK4 runs everywhere) | `config_app/` |
@@ -42,7 +43,7 @@ Turnpad is a set of separately running parts that talk over the session D-Bus an
 
 SpaceMouse mode reads the device through `spacenavd`: `spacenav_client.py` speaks its socket protocol (raw axes and buttons, which arrive before the daemon's dead zones and button map; a few requests change the cap's sensitivity for muting, per-application motion and hidden buttons). Whatever it changes is written to `~/.config/asus-turnpad/spacenav-restore.json` first and given back on exit and at the next start, so a crash leaves nothing behind. `spacemouse_dial.py` has no hardware imports: `ButtonMachine` turns raw button events into press and hold actions, `LayerState` keeps the active button layer, `SpaceCap` turns raw axes into a tilt angle, a twist and a push. `SpaceMouseSource` in `dialpad.py` runs them in the same input loop as the mouse (`listen_input_sources()`) and calls the state functions the touch loop uses, so a menu, a list or a function behaves the same with any input.
 
-The application link (`app_link.py`, a thread of the driver) is a Unix socket in the runtime directory that add-ons connect to (today the Blender add-on). Add-ons send their command catalog and mode; the driver sends only `run` for an id from that catalog and never executes anything it receives. `GetAppCommands` and `DriverState` give the settings app and the screen the catalog and the mode; profile contexts (`select_profile_context()`) switch menus and buttons by window title or mode. `app_suggest.py` offers a ready profile for an application without one, as a notification from `desktop/notifications.py` whose button starts the settings app with `--add-profile`.
+The application link (`app_link.py`, a thread of the driver) is a Unix socket in the runtime directory that add-ons connect to (today the Blender add-on). Applications without add-ons but with a control channel get a bridge instead: `integrations/bridges.py` runs the bridges on one more thread of the driver, and each joins the socket like an add-on through the shared client `integrations/applink/` (the Blender add-on's twin), turning `run` requests into the application's own requests (SolidCraft: JSON lines on its token-protected localhost port, `integrations/solidcraft/`). Add-ons send their command catalog and mode; the driver sends only `run` for an id from that catalog and never executes anything it receives. `GetAppCommands` and `DriverState` give the settings app and the screen the catalog and the mode; profile contexts (`select_profile_context()`) switch menus and buttons by window title or mode. `app_suggest.py` offers a ready profile for an application without one, as a notification from `desktop/notifications.py` whose button starts the settings app with `--add-profile`.
 
 Programs that only follow or steer the driver (the screen service, a script) use the D-Bus signal `DriverState` and the `Control` method; the contract is in `AGENTS.md`.
 

@@ -15,7 +15,7 @@ It is also a companion for the SpaceMouse and the SpacePilot Pro: buttons with s
 
 What Turnpad adds to the original driver:
 
-- **Settings app** (GTK4/libadwaita): per-application profiles, a function library, pre-programmed packs in a basic and an advanced variant (browsers, GIMP, Krita, Inkscape, darktable, Blender, Kdenlive, DaVinci Resolve, Shotcut, Audacity, OBS Studio, LibreOffice, code editors, file managers, Spotify, video players), ready groups, function colours and order, import/export.
+- **Settings app** (GTK4/libadwaita): per-application profiles, a function library, pre-programmed packs in a basic and an advanced variant (browsers, GIMP, Krita, Inkscape, darktable, Blender, SolidCraft, Kdenlive, DaVinci Resolve, Shotcut, Audacity, OBS Studio, LibreOffice, code editors, file managers, Spotify, video players), ready groups, function colours and order, import/export.
 - **ASUS Dial behaviour**: radial menu or single-function mode, per-app sensitivity and scroll speed, remembered last function, tap centre for the function's action, hold centre for the menu, horizontal scroll and Ctrl+wheel zoom.
 - **Groups**: a sector that opens a straight list of more functions beside the dial; turn to move along it, tap the centre to choose. More functions fit without smaller sectors.
 - **GNOME Shell overlay**: native radial dial with value gauge, rotation hints and finger position; size, position (anywhere on the screen or next to the mouse pointer) and visibility configurable: always visible, fading while you turn, or a small label instead of the dial — for all apps, per profile or per function.
@@ -24,7 +24,7 @@ What Turnpad adds to the original driver:
 - **SpaceMouse mode**: every button of a SpaceMouse or SpacePilot Pro with a short and a long press (the device's dual-function keys included), button layers, the radial menu and group lists on the cap (tilt to pick, twist to turn, push to choose), and per-application button maps in the packs for Blender, FreeCAD, KiCad and more. Needs `spacenavd`.
 - **SpacePilot Pro screen**: the device's own 320×240 colour screen shows the function keys with their actions, the live dial, every button of the active application, the cap's motion and a clock; its nine keys steer the dial and the pages.
 - **Cap motion per application**: sensitivity, locked and inverted axes, rotation and pan switched off, per profile, given back to `spacenavd` when you leave the application.
-- **App link and Blender add-on**: applications tell the driver their commands and what you are doing (Edit Mesh, Sculpt…); a dial function or a button can run a Blender command by name, and the mode picks the menu through contexts. The settings app installs the add-on.
+- **App link and Blender add-on**: applications tell the driver their commands and what you are doing (Edit Mesh, Sculpt…); a dial function or a button can run a Blender command by name, and the mode picks the menu through contexts. The settings app installs the add-on. SolidCraft needs no add-on: the driver links it through its control port ([SOLIDCRAFT.md](SOLIDCRAFT.md)).
 - **Contexts**: a profile can change its menu, buttons and screen by window title or by the application's mode.
 - **Setup assistant**: on the first start it looks at your hardware and suggests the modes; a profile for an application without one is offered in a notification, with a ready pack.
 - **Portable settings**: export everything that is not specific to a computer and import it on another; the machine's devices and touchpad geometry stay.
@@ -51,7 +51,7 @@ Turnpad speaks `spacenavd`'s socket protocol as one more client, so it works nex
 - **Layers**: a button switches a second map over the first (while held, for the next press, or until pressed again).
 - **Cap motion per application**: sensitivity and axes of the cap for other programs, per profile, plus Rotation, Pan/Zoom and +/− buttons that change it on the fly.
 - **Screen**: the SpacePilot Pro's colour screen, driven by its own service.
-- **Ready maps**: the packs for GIMP, Krita, Inkscape, darktable, Blender, FreeCAD, KiCad, Kdenlive and DaVinci Resolve carry a button map with labels for the screen.
+- **Ready maps**: the packs for GIMP, Krita, Inkscape, darktable, Blender, FreeCAD, SolidCraft, KiCad, Kdenlive and DaVinci Resolve carry a button map with labels for the screen.
 
 ![SpacePilot Pro screen: function keys](./preview/screen-keys.png) ![SpacePilot Pro screen: the dial](./preview/screen-dial.png)
 
@@ -138,7 +138,7 @@ Everything is set up in the **Turnpad** app (applications menu); changes apply i
 - A default profile plus profiles per application, switched automatically with the focused window (desktop ID on GNOME, window title or binary elsewhere)
 - Radial-menu mode with several functions, or single-function mode where the dial always controls one function
 - Per-profile sensitivity, scroll speed and "remember last function"
-- Pre-programmed packs, basic or advanced, for browsers, GIMP, Krita, Inkscape, darktable, Blender, Kdenlive, DaVinci Resolve, Shotcut, Audacity, OBS Studio, LibreOffice, code editors, file managers, Spotify and video players; import/export of profiles
+- Pre-programmed packs, basic or advanced, for browsers, GIMP, Krita, Inkscape, darktable, Blender, SolidCraft, Kdenlive, DaVinci Resolve, Shotcut, Audacity, OBS Studio, LibreOffice, code editors, file managers, Spotify and video players; import/export of profiles
 - Launchers: a function with only a tap action runs as soon as it is chosen in the radial menu, like the radial menus of 3D mice. The library has Calculator, Terminal, Files, Screenshot, Lock screen and My script (any command or bash script); programs keep running without blocking the dial
 - Groups (folders): a sector of the menu that opens a straight list of more functions beside the dial, one level deep. The library's *Apps* group holds all the launchers; *Group* under Custom starts an empty one, and functions already on the dial can be moved into it
 - Contexts: a profile can have contexts that apply while the window title contains some text (`|` for alternatives) or while the application reports a mode (Blender: Edit Mesh, Sculpt…). A context can have its own dial menu, SpaceMouse buttons and screen start page; the first one that matches wins
@@ -179,7 +179,7 @@ Everything is set up in the **Turnpad** app (applications menu); changes apply i
 - Button layers (hold, once, toggle), globally and per application
 - Per-application button maps and cap motion (sensitivity, per-axis sensitivity and direction, rotation and pan on or off); `hide_buttons` keeps the buttons Turnpad uses from other programs, `mute_others` silences them while the dial is on
 - The SpacePilot Pro's screen: Keys, Dial, All buttons, Motion and Clock pages, quick settings, themes, per-application start page, accent and labels
-- App commands: a button or function can run a command of the focused application through the app link; the Blender add-on is installed from the settings app
+- App commands: a button or function can run a command of the focused application through the app link; the Blender add-on is installed from the settings app, SolidCraft is linked by a bridge in the driver ([SOLIDCRAFT.md](SOLIDCRAFT.md))
 
 **Base driver** (from the original project)
 

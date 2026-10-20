@@ -45,7 +45,7 @@ for path in \
     /usr/lib/systemd/user/asus-turnpad.service \
     /usr/lib/systemd/user/asus-turnpad-overlay.service \
     /usr/lib/systemd/user/asus-turnpad-screen.service "$APP/screen/__init__.py" \
-    "$APP/app_link.py" "$APP/integrations/blender/turnpad/blender_manifest.toml" "$APP/integrations/blender/turnpad/__init__.py" \
+    "$APP/app_link.py" "$APP/integrations/blender/turnpad/blender_manifest.toml" "$APP/integrations/blender/turnpad/__init__.py" "$APP/integrations/bridges.py" "$APP/integrations/solidcraft/__init__.py" \
     /usr/lib/udev/rules.d/70-asus-turnpad.rules \
     /usr/lib/modules-load.d/asus-turnpad.conf \
     /usr/lib/sysusers.d/asus-turnpad.conf \

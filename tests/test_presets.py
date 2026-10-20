@@ -147,7 +147,7 @@ class SpaceMouseButtonsTest(unittest.TestCase):
                     yield pack, advanced, buttons
 
     def test_creator_packs_have_buttons(self):
-        for name in ("GIMP", "Krita", "Inkscape", "darktable", "Blender", "FreeCAD", "KiCad",
+        for name in ("GIMP", "Krita", "Inkscape", "darktable", "Blender", "FreeCAD", "SolidCraft", "KiCad",
                      "Kdenlive", "DaVinci Resolve"):
             pack = next(pack for pack in APP_PACKS if pack.name == name)
             with self.subTest(pack=name):
@@ -186,8 +186,11 @@ class SpaceMouseButtonsTest(unittest.TestCase):
                         self.assertLessEqual(len(button.label), SHORT_LABEL)
                         self.assertLessEqual(len(button.label), SPACEMOUSE_LABEL_MAX)
                     for action in bound:
-                        self.assertIn(action.type, ("macro", "key_hold"))
-                        self.assertTrue(action.keys or action.macro, key)
+                        self.assertIn(action.type, ("macro", "key_hold", "app"))
+                        if action.type == "app":
+                            self.assertTrue(action.command, key)
+                        else:
+                            self.assertTrue(action.keys or action.macro, key)
 
     def test_function_keys_only_on_their_indexes(self):
         # The five function keys (12-16 short, 17-21 long) are all set; Menu (0) stays the dial
@@ -252,6 +255,52 @@ class SpaceMouseButtonsTest(unittest.TestCase):
                 self.assertEqual(again.profiles[0].spacemouse_buttons, profile.spacemouse_buttons)
 
 
+# SolidCraft command ids the pack runs, checked against its registry
+# (crates/engine/src/cmd at 41a62d2) with their default keys (CommandSpec .key).
+SOLIDCRAFT_COMMANDS = {
+    "edit.undo": "Ctrl+Z", "edit.redo": "Ctrl+Y", "sketch.create": "", "sketch.finish": "",
+    "sketch.line": "L", "sketch.rectangle.two_point": "R", "sketch.circle.center": "C",
+    "sketch.dimension": "D", "sketch.trim": "T", "solid.extrude": "E", "solid.revolve": "",
+    "solid.fillet": "F", "solid.chamfer": "", "solid.hole": "H", "solid.shell": "",
+    "solid.press_pull": "Q", "inspect.measure": "I", "inspect.section": "", "parameters.change": "",
+    "appearance.assign": "A",
+}
+
+
+class SolidCraftPackTest(unittest.TestCase):
+    """Every step of the pack names a command of the bridge's catalog and
+    presses that command's own keys when the bridge is not there."""
+
+    def app_actions(self):
+        pack = next(pack for pack in APP_PACKS if pack.name == "SolidCraft")
+        for advanced in (False, True):
+            profile = profile_for_pack(pack, advanced)
+            for segment in functions(profile):
+                for step in segment.macro_cw + segment.macro_ccw + segment.macro_center:
+                    if step.command:
+                        yield step.command, list(step.keys or [])
+            for button in profile.spacemouse_buttons.values():
+                if button.press.type == "app":
+                    yield button.press.command, list(button.press.keys or [])
+
+    def test_commands_and_their_keys(self):
+        from config.labels import parse_keys
+        from integrations.solidcraft.catalog import VIEW_BY_ID
+
+        seen = set()
+        for command, fallback in self.app_actions():
+            seen.add(command)
+            with self.subTest(command=command):
+                if command in VIEW_BY_ID:
+                    expected = VIEW_BY_ID[command].keys
+                else:
+                    self.assertIn(command, SOLIDCRAFT_COMMANDS)
+                    expected = SOLIDCRAFT_COMMANDS[command]
+                self.assertEqual(fallback, parse_keys(expected)[0] if expected else [])
+        self.assertIn("turnpad.orbit_left", seen)
+        self.assertIn("solid.extrude", seen)
+
+
 class PackMatchTest(unittest.TestCase):
     def test_desktop_ids(self):
         expected = {
@@ -273,6 +322,7 @@ class PackMatchTest(unittest.TestCase):
             "io.mpv.Mpv.desktop": "Video player",
             "libreoffice-calc.desktop": "LibreOffice",
             "org.freecad.FreeCAD.desktop": "FreeCAD",
+            "ai.storyteller.solidcraft.desktop": "SolidCraft",
             "org.kicad.kicad.desktop": "KiCad",
             "org.kicad.pcbnew.desktop": "KiCad",
             "eeschema": "KiCad",

@@ -32,7 +32,8 @@ for module in *.py; do
     [[ $module == dialpad.py || $module == dialpad_ui.py ]] || MODULES+=("$module")
 done
 install -Dm644 -t "$APP" "${MODULES[@]}" laptop_touchpad_dialpad_layouts.csv
-for dir in config config_app desktop layouts overlay screen; do
+# integrations/: the bridge host, the bridges' app link client and the bridges.
+for dir in config config_app desktop layouts overlay screen integrations integrations/applink integrations/solidcraft; do
     install -Dm644 -t "$APP/$dir" "$dir"/*.py
 done
 chmod 755 "$APP/config_app/main.py"
@@ -65,4 +66,4 @@ install -Dm644 "packaging/$SLUG.modules-load" "$ROOT/usr/lib/modules-load.d/$SLU
 install -Dm644 "packaging/$SLUG.sysusers" "$ROOT/usr/lib/sysusers.d/$SLUG.conf"
 install -Dm755 "packaging/$SLUG-setup" "$ROOT/usr/bin/$SLUG-setup"
 
-install -Dm644 -t "$ROOT/usr/share/doc/$SLUG" README.md CHANGELOG.md PORTING.md SKINS.md SPACEMOUSE.md
+install -Dm644 -t "$ROOT/usr/share/doc/$SLUG" README.md CHANGELOG.md PORTING.md SKINS.md SPACEMOUSE.md SOLIDCRAFT.md
