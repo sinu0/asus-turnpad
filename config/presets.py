@@ -449,7 +449,7 @@ def freecad_profile_segments() -> list[Segment]:
     ]
 
 
-# SolidCraft 0.13 (github.com/bherbruck/solidcraft, checked at 41a62d2). The
+# SolidCraft 0.18 (github.com/bherbruck/solidcraft, checked at 41a62d2). The
 # bridge (integrations/solidcraft) runs every step by id, in the window that
 # has the focus; without it the step's keys are pressed: the arrows turn the
 # view 15 degrees and Ctrl+arrows pan (crates/ui-egui/src/navigation.rs

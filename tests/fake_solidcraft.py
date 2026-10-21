@@ -30,12 +30,12 @@ REGISTRY = [
 
 
 class FakeSolidCraft:
-    def __init__(self, token_dir, version="0.13.0"):
+    def __init__(self, token_dir, version="0.18.1"):
         self.token = secrets.token_hex(32)
         self.version = version
         self.camera = {"target": [0.0, 0.0, 0.0], "yaw": 0.5, "pitch": 0.6, "roll": 0.0,
                        "distance": 200.0, "fov": 0.0, "up": "Z"}
-        self.ui = {"tab": "SOLID"}
+        self.ui = {"tab": "MODEL"}
         self.tool = None
         self.dialog = None
         self.viewport = [0.0, 80.0, 1200.0, 800.0]

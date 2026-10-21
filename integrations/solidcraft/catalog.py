@@ -3,10 +3,12 @@ catalog entries: the bridge's own view commands (camera steps a dial can turn,
 which SolidCraft has no keys for) and SolidCraft's toolbar commands, read from
 its registry (``engine.commands``) when the bridge connects.
 
-Checked against SolidCraft 41a62d2 (2026-10-20): crates/engine/src/cmd/*.rs
-(CommandSpec ids, labels, tabs, keys), crates/ui-egui/src/keymap.rs and
-toolbar.rs (keys the window itself handles: arrows turn the view 15 degrees,
-Shift+arrows 90, Ctrl+arrows pan, F6 fits, S opens command search)."""
+Checked against SolidCraft 0.18.1 (41a62d2, 2026-10-20) and run against it:
+crates/engine/src/cmd/*.rs (CommandSpec ids, labels, tabs, keys),
+crates/ui-egui/src/workspace.rs (PLACEMENTS: where a command's tab and panel
+sit on the ribbon), keymap.rs and toolbar.rs (keys the window itself handles:
+arrows turn the view 15 degrees, Shift+arrows 90, Ctrl+arrows pan, F6 fits, S
+opens command search)."""
 
 from __future__ import annotations
 
@@ -61,6 +63,43 @@ VIEW_COMMANDS = (
 VIEW_BY_ID = {command.id: command for command in VIEW_COMMANDS}
 
 
+# CommandSpec (tab, panel) -> the ribbon's (tab, panel): twin of PLACEMENTS in
+# crates/ui-egui/src/workspace.rs. A few commands have a section of their own
+# there; the placement is right for the rest and for every mode.
+PLACEMENTS = {
+    ("SOLID", "CREATE"): ("MODEL", "CREATE"),
+    ("SOLID", "MODIFY"): ("MODEL", "MODIFY"),
+    ("SOLID", "CONSTRUCT"): ("MODEL", "CONSTRUCT"),
+    ("SOLID", "ASSEMBLE"): ("ASSEMBLE", "JOINTS"),
+    ("SOLID", "POSITION"): ("ASSEMBLE", "POSITION"),
+    ("SOLID", "CONFIGURE"): ("MANAGE", "CONFIGURATIONS"),
+    ("SOLID", "INSPECT"): ("INSPECT", "CHECK"),
+    ("SOLID", "INSERT"): ("INSERT", "FILES"),
+    ("SURFACE", "CREATE"): ("SURFACE", "CREATE"),
+    ("SURFACE", "MODIFY"): ("SURFACE", "EDIT"),
+    ("SURFACE", "INSPECT"): ("INSPECT", "SURFACE QUALITY"),
+    ("SKETCH", "CREATE"): ("SKETCH", "CREATE"),
+    ("SKETCH", "MODIFY"): ("SKETCH", "MODIFY"),
+    ("SKETCH", "PATTERN"): ("SKETCH", "PATTERN"),
+    ("SKETCH", "CONSTRAINTS"): ("SKETCH", "CONSTRAIN"),
+    ("SKETCH", "INSERT"): ("INSERT", "IMAGES"),
+    ("SKETCH", "INSPECT"): ("INSPECT", "SURFACE QUALITY"),
+    ("SKETCH", "FINISH SKETCH"): ("SKETCH", "FINISH SKETCH"),
+    ("SHEET METAL", "CREATE"): ("SHEET METAL", "CREATE"),
+    ("SHEET METAL", "MODIFY"): ("SHEET METAL", "FLAT"),
+    ("PLASTIC", "CREATE"): ("MODEL", "CREATE"),
+    ("PLASTIC", "SETUP"): ("MANAGE", "RULES"),
+    ("MESH", "MODIFY"): ("INSERT", "FILES"),
+    ("RENDER", "SCENE"): ("RENDER", "SCENE"),
+    ("RENDER", "IMAGE"): ("RENDER", "IMAGE"),
+}
+
+
+def ribbon_place(tab, panel) -> tuple[str, str]:
+    """Where a command of (tab, panel) shows on the ribbon."""
+    return PLACEMENTS.get((str(tab or ""), str(panel or "")), (str(tab or ""), str(panel or "")))
+
+
 def mode_of_tab(tab) -> str:
     """A ribbon tab as an app link mode: "SHEET METAL" is "sheet_metal"."""
     return "_".join(str(tab or "").lower().split())
@@ -84,7 +123,8 @@ def app_entries(commands) -> list[dict]:
         if not _wanted(command):
             continue
         identifier = str(command.get("id") or "")
-        tab, panel = command.get("tab") or "", command.get("panel") or ""
+        # Modes and categories name the ribbon the user sees (MODEL, not SOLID).
+        tab, panel = ribbon_place(command.get("tab"), command.get("panel"))
         category = " › ".join(part for part in (_title(tab), _title(panel)) if part) or "Edit"
         entries.append({
             "id": identifier,

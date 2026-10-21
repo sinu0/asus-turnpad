@@ -49,7 +49,7 @@ Without the bridge, roll, the standard views and Home show a notice ("No Turnpad
 
 ## Contexts
 
-While linked, the bridge reports the ribbon tab as the application mode: `solid`, `sketch` (while a sketch is edited), `surface`, `sheet_metal`, `render`, …, with the open tool or dialog as detail. In Dial Controls › Contexts, a context with the mode `sketch` can give the dial a sketching menu that shows only while you sketch.
+While linked, the bridge reports the ribbon tab as the application mode: `model`, `sketch` (while a sketch is edited), `surface`, `assemble`, `sheet_metal`, `inspect`, `manage`, `render`, …, with the open tool or dialog as detail. In Dial Controls › Contexts, a context with the mode `sketch` can give the dial a sketching menu that shows only while you sketch.
 
 ## Troubleshooting
 

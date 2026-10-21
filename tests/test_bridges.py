@@ -130,7 +130,7 @@ class ControlClientTest(unittest.TestCase):
     def test_token_on_the_first_request_only(self):
         client = control.ControlClient(self.app.port, self.app.token)
         client.open()
-        self.assertEqual(client.call("ui.help")["version"], "0.13.0")
+        self.assertEqual(client.call("ui.help")["version"], "0.18.1")
         self.assertEqual(client.call("ui.camera")["distance"], 200.0)
         with self.assertRaisesRegex(control.ControlError, "unknown view"):
             client.call("ui.view", {"view": "sideways"})
@@ -170,8 +170,8 @@ class CatalogTest(unittest.TestCase):
         self.assertEqual(ids[:len(views)], views)
         self.assertEqual(ids[len(views):], ["edit.undo", "solid.extrude", "solid.fillet", "sketch.line", "sheet.flange"])
         extrude = entries[ids.index("solid.extrude")]
-        self.assertEqual(extrude, {"id": "solid.extrude", "title": "Extrude", "category": "Solid › Create",
-                                   "icon": "", "keys": "E", "modes": ["solid"]})
+        self.assertEqual(extrude, {"id": "solid.extrude", "title": "Extrude", "category": "Model › Create",
+                                   "icon": "", "keys": "E", "modes": ["model"]})
         self.assertEqual(entries[ids.index("sheet.flange")]["modes"], ["sheet_metal"])
         self.assertEqual(entries[ids.index("edit.undo")]["category"], "Edit")
         # The driver keeps every entry as it is.
@@ -211,7 +211,7 @@ class RunnerTest(unittest.TestCase):
     def setUp(self):
         self.calls = []
         self.camera = {"yaw": 0.0, "pitch": 1.5, "roll": 6.27, "distance": 100.0, "target": [0, 0, 0]}
-        self.mode = "solid"
+        self.mode = "model"
         entries = catalog.wire_catalog([
             {"id": "solid.extrude", "label": "Extrude", "tab": "SOLID", "panel": "CREATE", "shortcut": "E"},
             {"id": "sketch.line", "label": "Line", "tab": "SKETCH", "panel": "CREATE", "shortcut": "L"},
@@ -336,9 +336,9 @@ class BridgeTest(unittest.TestCase):
     def test_commands_reach_solidcraft(self):
         self.assertTrue(wait_for(self.linked))
         answer = self.link.commands(DESKTOP_ID)
-        self.assertEqual((answer["app"], answer["name"], answer["version"]), ("solidcraft", "SolidCraft", "0.13.0"))
+        self.assertEqual((answer["app"], answer["name"], answer["version"]), ("solidcraft", "SolidCraft", "0.18.1"))
         self.assertIn("solid.extrude", [entry["id"] for entry in answer["commands"]])
-        self.assertTrue(wait_for(lambda: self.link.context_for(DESKTOP_ID).get("mode") == "solid"))
+        self.assertTrue(wait_for(lambda: self.link.context_for(DESKTOP_ID).get("mode") == "model"))
 
         self.assertEqual(self.link.run(DESKTOP_ID, "solid.extrude"), (app_link.SENT, "solidcraft"))
         self.assertTrue(wait_for(lambda: ("ui.start", {"command": "solid.extrude"}) in self.app.requests))
