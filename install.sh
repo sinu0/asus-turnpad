@@ -149,7 +149,7 @@ set -o pipefail
     sudo install -m 644 -t "$INSTALL_DIR_PATH/integrations/applink" integrations/applink/*.py
     sudo install -m 644 -t "$INSTALL_DIR_PATH/integrations/solidcraft" integrations/solidcraft/*.py
     sudo install -m 755 config_app/main.py "$INSTALL_DIR_PATH/config_app/main.py"
-    sudo install -m 644 config_app/__init__.py config_app/blender_addon.py config_app/commandline.py config_app/context_dialogs.py config_app/contexts.py config_app/device_dialogs.py config_app/hardware.py config_app/key_capture.py config_app/outline_editor.py config_app/recorder.py config_app/recorder_dialog.py config_app/screen_page.py config_app/spacemouse.py config_app/spacemouse_extra.py config_app/spacemouse_ui.py config_app/icon.svg config_app/style.css "config_app/$APP_ID.desktop" "$INSTALL_DIR_PATH/config_app/"
+    sudo install -m 644 config_app/__init__.py config_app/blender_addon.py config_app/commandline.py config_app/context_dialogs.py config_app/contexts.py config_app/device_dialogs.py config_app/hardware.py config_app/key_capture.py config_app/outline_editor.py config_app/plugins.py config_app/plugins_ui.py config_app/recorder.py config_app/recorder_dialog.py config_app/screen_page.py config_app/spacemouse.py config_app/spacemouse_extra.py config_app/spacemouse_ui.py config_app/icon.svg config_app/style.css "config_app/$APP_ID.desktop" "$INSTALL_DIR_PATH/config_app/"
     sudo install -m 644 gnome/extension/extension.js gnome/extension/dial.js gnome/extension/layers.js gnome/extension/skins.json gnome/extension/metadata.json gnome/extension/stylesheet.css "$INSTALL_DIR_PATH/gnome/extension/"
 
     mkdir -p "$(dirname "$LAUNCHER_PATH")" "$(dirname "$ICON_PATH")"

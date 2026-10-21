@@ -3,13 +3,31 @@
 [SolidCraft](https://github.com/bherbruck/solidcraft) is an open-source parametric CAD program. Turnpad drives it two ways:
 
 - **With its keys**, out of the box: the *SolidCraft* pack (Dial Controls › Add a profile › 3D) turns the view with the arrow keys, fits with F6, opens command search with S and starts Extrude, Fillet, Line and other tools with their keys.
-- **Through the SolidCraft bridge**, once SolidCraft listens on a control port: every dial step and button runs SolidCraft's own command by id, in the SolidCraft window that has the focus (keys reach the window under the pointer). The view turns in 5° steps without the arrow keys' animation. Roll, the standard views (Front, Top, Right, …) and Home work too, although SolidCraft has no keys for them, and profile contexts can follow the ribbon tab (Sketch, Solid, Render…).
+- **As a SolidCraft plugin**, once SolidCraft listens on a control port: every dial step and button runs SolidCraft's own command by id, in the SolidCraft window that has the focus (keys reach the window under the pointer). The view turns in 5° steps without the arrow keys' animation. Roll, the standard views (Front, Top, Right, …) and Home work too, although SolidCraft has no keys for them, and profile contexts can follow the ribbon tab (Model, Sketch, Render…).
 
-The bridge runs inside the Turnpad driver; there is nothing to install in SolidCraft.
+Turnpad shows up in SolidCraft's own *Preferences › Plugins* list, where you can untick it to unlink Turnpad. SolidCraft runs no plugin code yet, so the plugin is a folder with a `plugin.json` that names it; the work is done by the SolidCraft bridge inside the Turnpad driver, which links a SolidCraft only while the plugin is there and ticked.
 
-## Turn on SolidCraft's control port
+## Set it up
 
-SolidCraft opens its control channel only when asked to. Set the port once for your session:
+The **Plugins** page of the Turnpad settings app does both steps with a button each and shows whether SolidCraft is linked:
+
+1. **Control port**: *Turn on* writes `~/.config/environment.d/solidcraft.conf`; log out and in once.
+2. **Turnpad plugin**: *Add* puts `turnpad/plugin.json` into SolidCraft's plugins folder (the native build's, and the Flatpak's or Snap's when you have them). The driver links SolidCraft within seconds.
+
+The page can also add the ready-made SolidCraft profile. By hand, the same steps are:
+
+```bash
+mkdir -p ~/.config/environment.d
+echo 'SOLIDCRAFT_CONTROL_PORT=7878' > ~/.config/environment.d/solidcraft.conf
+mkdir -p ~/.local/share/solidcraft/plugins/turnpad
+python3 -c 'import json, sys; sys.path.insert(0, "/usr/share/asus-turnpad"); sys.path.insert(0, "/opt/asus-turnpad")
+from integrations.solidcraft import plugin; print(json.dumps(plugin.MANIFEST, indent=2))' \
+    > ~/.local/share/solidcraft/plugins/turnpad/plugin.json
+```
+
+## SolidCraft's control port
+
+SolidCraft opens its control channel only when asked to. The port is set once for your session:
 
 ```bash
 mkdir -p ~/.config/environment.d
@@ -17,6 +35,8 @@ echo 'SOLIDCRAFT_CONTROL_PORT=7878' > ~/.config/environment.d/solidcraft.conf
 ```
 
 Log out and in again. Every SolidCraft you start from the desktop then listens on `127.0.0.1:7878` (or run `solidcraft --control 7878` from a terminal). Any free port works, but only one SolidCraft window can use a given port.
+
+For the Flatpak, give the port to the sandbox as well: `flatpak override --user --env=SOLIDCRAFT_CONTROL_PORT=7878 ai.storyteller.solidcraft`.
 
 The channel is protected: each launch makes a new random token, which SolidCraft writes to a file only you can read (`~/.local/share/solidcraft/control/7878.token`; the Flatpak and the Snap keep it in their own data folders, which the bridge also checks). The bridge connects only with that token, only to a port that your own user listens on, and it sends SolidCraft only the commands of SolidCraft's own toolbar plus the view commands listed below.
 
@@ -53,6 +73,8 @@ While linked, the bridge reports the ribbon tab as the application mode: `model`
 
 ## Troubleshooting
 
+- The Plugins page's *Link* line says what is missing: the driver, the plugin, the port, or SolidCraft itself.
+- "turned off in SolidCraft's Preferences › Plugins": tick Turnpad there again; the link comes back within seconds.
 - `busctl --user call io.github.sinu0.AsusTurnpad.Driver /io/github/sinu0/AsusTurnpad/Driver io.github.sinu0.AsusTurnpad.Driver GetStatus` shows `bridges` with the bridge's `state` (`waiting`, `linked`), its `port` and the last `detail` (why a token file did not lead to SolidCraft).
 - `journalctl --user -u asus-turnpad.service | grep SolidCraft` shows when the bridge linked and why it let go.
 - No token file in `~/.local/share/solidcraft/control/`: SolidCraft was started without a control port (see above; the environment.d file needs a new login).

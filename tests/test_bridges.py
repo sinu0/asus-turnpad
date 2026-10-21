@@ -23,7 +23,7 @@ from fake_solidcraft import FakeSolidCraft  # noqa: E402
 from integrations import bridge_base, bridges  # noqa: E402
 from integrations import solidcraft  # noqa: E402
 from integrations.applink import protocol  # noqa: E402
-from integrations.solidcraft import catalog, context, control, runner  # noqa: E402
+from integrations.solidcraft import catalog, context, control, plugin, runner  # noqa: E402
 
 DESKTOP_ID = "ai.storyteller.solidcraft.desktop"
 
@@ -311,7 +311,13 @@ class BridgeTest(unittest.TestCase):
         self.environ = {"HOME": os.path.join(self.tmp.name, "home"),
                         "SOLIDCRAFT_CONTROL_DIR": os.path.join(self.tmp.name, "control")}
         self.app = FakeSolidCraft(self.environ["SOLIDCRAFT_CONTROL_DIR"])
+        # The token folder is <tmp>/control, so <tmp> is this SolidCraft's data folder.
+        self.data_root = self.tmp.name
+        plugin.install(self.data_root)
         self.bridge = solidcraft.Bridge(self.link.path, environ=self.environ)
+        # Quicker than in the driver, so switching the plugin is seen within the test.
+        self.bridge.CONTEXT_S = 0.05
+        self.bridge.REFUSE_S = 0.3
         self.host = bridges.BridgeHost(self.link.path, modules=())
         self.host._bridges = [("solidcraft", self.bridge)]
         self._stop = threading.Event()
@@ -368,6 +374,21 @@ class BridgeTest(unittest.TestCase):
         self.app = FakeSolidCraft(self.environ["SOLIDCRAFT_CONTROL_DIR"], version="0.14.0")
         self.assertTrue(wait_for(lambda: self.linked() and self.link.commands(DESKTOP_ID)["version"] == "0.14.0",
                                  timeout=8))
+
+    def test_the_plugin_is_the_switch(self):
+        self.assertTrue(wait_for(self.linked))
+        # Turned off in SolidCraft's Preferences › Plugins: the link ends.
+        self.app.disabled_plugins = ["turnpad"]
+        self.assertTrue(wait_for(lambda: not self.linked()))
+        self.assertTrue(wait_for(lambda: solidcraft.OFF_IN_SOLIDCRAFT in self.bridge.detail))
+        # On again: linked again.
+        self.app.disabled_plugins = []
+        self.assertTrue(wait_for(self.linked, timeout=8))
+        # Removed from SolidCraft's plugins folder: the link ends and stays down.
+        self.assertTrue(plugin.remove(self.data_root))
+        self.assertTrue(wait_for(lambda: not self.linked()))
+        self.assertTrue(wait_for(lambda: solidcraft.NOT_INSTALLED in self.bridge.detail))
+        self.assertNotIn("ui.help", self.app.methods()[-3:], "without the plugin nothing is asked")
 
     def test_status_is_json(self):
         self.assertTrue(wait_for(self.linked))
@@ -480,6 +501,89 @@ class BaseBridgeTest(unittest.TestCase):
         now[0] += 0.01
         self.assertEqual(bridge.tick(), bridge.DISCOVER_S)
         self.assertFalse(bridge.linked)
+
+
+class PluginTest(unittest.TestCase):
+    """Turnpad as a SolidCraft plugin (integrations/solidcraft/plugin.py)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = os.path.join(self.tmp.name, "solidcraft")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_the_manifest_passes_solidcrafts_checks(self):
+        # crates/ui-egui/src/plugins.rs: deny_unknown_fields, id = folder, lengths, characters.
+        manifest = plugin.MANIFEST
+        self.assertEqual(set(manifest), {"id", "name", "version", "description"})
+        self.assertRegex(manifest["id"], r"\A[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?\Z")
+        self.assertTrue(0 < len(manifest["name"]) <= 80)
+        self.assertRegex(manifest["version"], r"\A[A-Za-z0-9.+-]{1,32}\Z")
+        self.assertLessEqual(len(manifest["description"]), 240)
+        for value in manifest.values():
+            self.assertFalse(any(ord(char) < 32 for char in value))
+
+    def test_install_upgrade_remove(self):
+        self.assertEqual(plugin.install_state(self.root), plugin.MISSING)
+        folder = plugin.install(self.root)
+        self.assertEqual(folder, os.path.join(self.root, "plugins", "turnpad"))
+        self.assertEqual(plugin.install_state(self.root), plugin.INSTALLED)
+        with open(os.path.join(folder, "plugin.json")) as handle:
+            self.assertEqual(json.load(handle), plugin.MANIFEST)
+        self.assertEqual(os.listdir(folder), ["plugin.json"], "no temporary file left")
+        older = dict(plugin.MANIFEST, version="0.9.0")
+        with open(os.path.join(folder, "plugin.json"), "w") as handle:
+            json.dump(older, handle)
+        self.assertEqual(plugin.install_state(self.root), plugin.OUTDATED)
+        self.assertTrue(plugin.installed(self.root), "an older manifest still links")
+        plugin.install(self.root)
+        self.assertEqual(plugin.install_state(self.root), plugin.INSTALLED)
+        self.assertTrue(plugin.remove(self.root))
+        self.assertFalse(os.path.exists(folder))
+        self.assertFalse(plugin.remove(self.root))
+
+    def test_a_folder_that_is_not_ours_is_left_alone(self):
+        folder = os.path.join(self.root, "plugins", "turnpad")
+        os.makedirs(folder)
+        with open(os.path.join(folder, "plugin.json"), "w") as handle:
+            json.dump({"id": "turnpad", "name": "Someone else", "version": "1"}, handle)
+        self.assertEqual(plugin.install_state(self.root), plugin.FOREIGN)
+        with self.assertRaises(OSError):
+            plugin.install(self.root)
+        self.assertFalse(plugin.remove(self.root))
+        self.assertTrue(os.path.exists(os.path.join(folder, "plugin.json")))
+
+    def test_links_are_not_followed(self):
+        elsewhere = os.path.join(self.tmp.name, "elsewhere")
+        os.makedirs(elsewhere)
+        os.makedirs(os.path.join(self.root, "plugins"))
+        os.symlink(elsewhere, os.path.join(self.root, "plugins", "turnpad"))
+        self.assertEqual(plugin.install_state(self.root), plugin.FOREIGN)
+        with self.assertRaises(OSError):
+            plugin.install(self.root)
+        self.assertEqual(os.listdir(elsewhere), [])
+
+    def test_which_data_folder_a_token_belongs_to(self):
+        self.assertEqual(plugin.root_of_token("/h/.local/share/solidcraft/control/7878.token"),
+                         "/h/.local/share/solidcraft")
+        self.assertIsNone(plugin.root_of_token("/run/elsewhere/7878.token"))
+        environ = {"HOME": self.tmp.name}
+        native = plugin.data_roots(environ)[0]
+        self.assertEqual(native, os.path.join(self.tmp.name, ".local", "share", "solidcraft"))
+        token = os.path.join(native, "control", "7878.token")
+        self.assertFalse(plugin.installed_for(token, environ))
+        plugin.install(native)
+        self.assertTrue(plugin.installed_for(token, environ))
+        # A moved control folder: any data folder with the plugin.
+        self.assertTrue(plugin.installed_for("/run/elsewhere/7878.token", environ))
+        self.assertEqual([root.endswith("solidcraft") for root in plugin.data_roots(environ)], [True] * 3)
+
+    def test_switch_in_solidcrafts_preferences(self):
+        self.assertTrue(plugin.disabled_in({"disabled_plugins": ["other", "turnpad"]}))
+        self.assertFalse(plugin.disabled_in({"disabled_plugins": ["other"]}))
+        self.assertFalse(plugin.disabled_in({"theme": "dark"}), "a SolidCraft without a plugin page")
+        self.assertFalse(plugin.disabled_in(None))
 
 
 class HostTest(unittest.TestCase):

@@ -10,7 +10,9 @@ whitespace (git diff --check without the CRs of dialpad.py), .desktop files,
 the overlay previews, and reminders of what only runs elsewhere (containers,
 a desktop). --baseline also runs the suite on REF in a temporary worktree and
 reports only failures that REF does not have, which separates regressions
-from a container that lacks GTK, gjs or libevdev. --list only prints the plan.
+from a container that lacks GTK, gjs or libevdev; --python runs the suite with
+another interpreter (the one the system's PyGObject is built for). --list only
+prints the plan.
 Exit status 1 when a check (or a new failure) fails."""
 
 from __future__ import annotations
@@ -53,9 +55,13 @@ def run(title: str, command: list[str], cwd: Path = ROOT, timeout: int = 900) ->
     return done.returncode == 0, output
 
 
+# The interpreter of the unit suite (--python): the one PyGObject was built for.
+PYTHON = sys.executable
+
+
 def suite(cwd: Path) -> tuple[set[str], str]:
     """Failing test ids of the unit suite in ``cwd`` and its last line."""
-    _ok, output = run("unit tests", [sys.executable, "-m", "unittest", "discover", "-s", "tests"], cwd=cwd)
+    _ok, output = run("unit tests", [PYTHON, "-m", "unittest", "discover", "-s", "tests"], cwd=cwd)
     failures = set(re.findall(r"^(?:ERROR|FAIL): (\S+ \([^)]*\))", output, re.M))
     summary = output.splitlines()[-1] if output else ""
     return failures, summary
@@ -108,7 +114,11 @@ def main() -> int:
     parser.add_argument("--base", default="origin/master")
     parser.add_argument("--baseline", action="store_true", help="tell new failures from ones REF has too")
     parser.add_argument("--list", action="store_true", help="print the plan only")
+    parser.add_argument("--python", default=sys.executable,
+                        help="interpreter of the unit suite (e.g. /usr/bin/python3.12 where gi is built for it)")
     args = parser.parse_args()
+    global PYTHON
+    PYTHON = args.python
 
     files = changed_files(args.base)
     steps = plan(files)

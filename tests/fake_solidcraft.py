@@ -39,6 +39,7 @@ class FakeSolidCraft:
         self.tool = None
         self.dialog = None
         self.viewport = [0.0, 80.0, 1200.0, 800.0]
+        self.disabled_plugins = []      # Preferences › Plugins: ids turned off
         self.requests = []          # (method, params) in order, authenticated ones only
         self.delay = threading.Event()   # set: requests are not answered (a busy UI thread)
         self._listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -125,6 +126,10 @@ class FakeSolidCraft:
     def _handle(self, method, params):
         if method == "ui.help":
             return {"diagnostics": "", "version": self.version, "commit": "41a62d2", "built": "2026-10-20"}
+        if method == "ui.prefs":
+            if params:
+                raise ValueError("the fake only reads preferences")
+            return {"theme": "dark", "disabled_plugins": list(self.disabled_plugins), "dialog": None}
         if method == "engine.commands":
             return REGISTRY
         if method == "ui.inspect":

@@ -32,7 +32,9 @@ The CI image is Arch (`archlinux:latest`). Ubuntu containers lack or have older 
 sudo apt-get update && sudo apt-get install -y python3-cairo python3-libevdev python3-gi gjs
 ```
 
-About 15 tests still fail here for the environment (`test_commandline`, `test_hardware`, `test_screen_*`, `test_dir_watch`, `test_mouse_dial` F13…). Use `--baseline`: it runs the same suite on the base commit in a temporary `git worktree` and fails only on failures the base does not have.
+The default `python3` of these images may be newer than the one the system's PyGObject is built for (gi then fails to import, and every `config_app` test with it). Run the suite with the system's interpreter: `checks.py --baseline --python /usr/bin/python3.12`, after `sudo apt-get install -y gir1.2-gtk-4.0 gir1.2-adw-1 libgtk-4-bin` for the settings app (GTK 4.14 and Adwaita 1.5, the oldest the app supports).
+
+With the wrong interpreter about 15 tests fail for the environment (`test_commandline`, `test_hardware`, `test_screen_*`, `test_dir_watch`…); with the system's one only `test_mouse_dial`'s F13 fallback does (Ubuntu's older libevdev). Use `--baseline`: it runs the same suite on the base commit in a temporary `git worktree` and fails only on failures the base does not have.
 
 ## Fast loops while working
 

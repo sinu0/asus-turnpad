@@ -646,10 +646,12 @@ class SpaceMouseExtras:
         if self._sm_blender_status is not None:
             self._sm_blender_status.set_subtitle(sx.describe_catalog(catalog))
 
-    def _install_blender_addon(self):
-        button = self._sm_blender_button
+    def _install_blender_addon(self, button=None, label="Install the Blender add-on"):
+        """In a thread; ``button`` (a row or a button) waits meanwhile and gets ``label`` back."""
+        button = button if button is not None else self._sm_blender_button
+        set_text = button.set_title if hasattr(button, "set_title") else button.set_label
         button.set_sensitive(False)
-        button.set_title("Installing the add-on…")
+        set_text("Installing the add-on…")
 
         def work():
             result = blender_addon.install(blender=blender_addon.find_blender())
@@ -657,7 +659,7 @@ class SpaceMouseExtras:
 
         def finished(result):
             button.set_sensitive(True)
-            button.set_title("Install the Blender add-on")
+            set_text(label)
             self._show_blender_result(result)
             return GLib.SOURCE_REMOVE
 
