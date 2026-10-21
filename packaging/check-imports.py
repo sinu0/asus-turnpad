@@ -27,6 +27,7 @@ import dialpad_dbus  # noqa: E402
 import config.legacy_adapter, config.migrate, config.runtime, config.schema, config.skins  # noqa: E402,E401
 import desktop.active_window, desktop.color_scheme, overlay.painter  # noqa: E402,E401
 import layout_detect  # noqa: E402
+import integrations.bridges, integrations.solidcraft  # noqa: E402,E401
 
 assert config.skins.load_skins(), "built-in skins not found next to the settings app"
 assert layout_detect.detect_layout(f"{app}/layouts") in {"proartp16", "asusvivobook16x", "zenbookpro14"}

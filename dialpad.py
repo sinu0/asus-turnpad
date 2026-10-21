@@ -158,6 +158,9 @@ pending_context_refresh = False
 context_name = ""
 # The app link server (app_link.py), None when it did not start.
 app_link = None
+# Bridges of applications with a control channel (integrations/bridges.py),
+# clients of the app link; None when none runs.
+bridge_host = None
 # The last thing worth telling the user on a device screen: a command that could
 # not run. "until" is when it stops counting for the DriverState.
 APP_NOTICE_SECONDS = 6
@@ -432,6 +435,7 @@ def get_dbus_status():
         "config_revision": config_state["revision"],
         "config_error": config_state["error"],
         "config_pending": config_state["pending"],
+        "bridges": json.dumps(bridge_host.status() if bridge_host is not None else {}),
     }
 
 def driver_state():
@@ -586,10 +590,28 @@ def start_app_link():
     link = AppLink(on_change=on_app_link_change, on_result=on_app_link_result)
     if link.start():
         app_link = link
+        start_bridges(link.path)
+
+def start_bridges(socket_path):
+    """Applications with a control channel instead of an add-on (SolidCraft)
+    join the app link through a bridge that runs on a thread of the driver."""
+    global bridge_host
+
+    try:
+        from integrations.bridges import BridgeHost
+
+        host = BridgeHost(socket_path)
+        if host.start():
+            bridge_host = host
+    except Exception:
+        log.exception("The application bridges are off")
 
 def stop_app_link():
-    global app_link
+    global app_link, bridge_host
 
+    host, bridge_host = bridge_host, None
+    if host is not None:
+        host.stop()
     link, app_link = app_link, None
     if link is not None:
         link.stop()

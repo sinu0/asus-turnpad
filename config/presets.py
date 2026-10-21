@@ -65,6 +65,12 @@ def keys(*names: str, title: str | None = None) -> MacroStep:
     return MacroStep(type=StepType.KEYSTROKE, keys=list(names), title=title)
 
 
+def app_step(command: str, *names: str, title: str | None = None) -> MacroStep:
+    """A command of the focused application by id, through its app link (an
+    add-on or a bridge); ``names`` are the keys pressed when it has none."""
+    return MacroStep(type=StepType.APP, command=command, keys=list(names) or None, title=title)
+
+
 def scroll(
     direction: str,
     *,
@@ -441,6 +447,75 @@ def freecad_profile_segments() -> list[Segment]:
               ("Dimension", "KEY_D"), color=COLORS["brush"], treshold=90),
         undo_redo([CTRL, "KEY_Y"]),
     ]
+
+
+# SolidCraft 0.18 (github.com/bherbruck/solidcraft, checked at 41a62d2). The
+# bridge (integrations/solidcraft) runs every step by id, in the window that
+# has the focus; without it the step's keys are pressed: the arrows turn the
+# view 15 degrees and Ctrl+arrows pan (crates/ui-egui/src/navigation.rs
+# view_key), F6 fits, S opens command search, Ctrl+Z / Ctrl+Y undo and redo
+# (toolbar.rs), Ctrl+8 looks at the selection, the wheel zooms at the pointer.
+# Command keys are the CommandSpec defaults (crates/engine/src/cmd): E
+# extrude, F fillet, H hole, Q press pull, M move, I measure; in a sketch L
+# line, R rectangle, C circle, D dimension, T trim, O offset, P project, X
+# construction (a sketch key outside a sketch opens Create Sketch first).
+# Roll, the standard views and Home have no keys: they need the bridge.
+def _app_turn(title, cw, ccw, tap=None, *, color, treshold=30):
+    """Like _turn, with (title, command id, *fallback keys) per action."""
+    return _segment(
+        title,
+        [app_step(cw[1], *cw[2:], title=cw[0])],
+        [app_step(ccw[1], *ccw[2:], title=ccw[0])],
+        [app_step(tap[1], *tap[2:], title=tap[0])] if tap else None,
+        color=color, treshold=treshold,
+    )
+
+
+def _app_tap(title, tap, *, color, icon=None):
+    """An action-only function that runs a command of the application."""
+    segment = _segment(title, [], [], [app_step(tap[1], *tap[2:], title=tap[0])], color=color)
+    segment.icon_url = icon
+    return segment
+
+
+def _solidcraft_orbit() -> Segment:
+    return _app_turn("Orbit", ("Orbit right", "turnpad.orbit_right", "KEY_RIGHT"),
+                     ("Orbit left", "turnpad.orbit_left", "KEY_LEFT"), ("Fit", "turnpad.view_fit", "KEY_F6"),
+                     color=COLORS["navigate"], treshold=20)
+
+
+def _solidcraft_tilt() -> Segment:
+    return _app_turn("Orbit up / down", ("Orbit down", "turnpad.orbit_down", "KEY_DOWN"),
+                     ("Orbit up", "turnpad.orbit_up", "KEY_UP"), ("Home view", "turnpad.view_home"),
+                     color=COLORS["navigate"], treshold=20)
+
+
+def _solidcraft_zoom() -> Segment:
+    # The wheel: SolidCraft zooms at the pointer, with or without the bridge.
+    return _segment("Zoom", [scroll("clockwise", title="Zoom in")], [scroll("counterclockwise", title="Zoom out")],
+                    [app_step("turnpad.view_fit", "KEY_F6", title="Fit")], color=COLORS["zoom"], treshold=30)
+
+
+def _solidcraft_pan() -> Segment:
+    pan = _app_turn("Pan", ("Pan right", "turnpad.pan_right", CTRL, "KEY_RIGHT"),
+                    ("Pan left", "turnpad.pan_left", CTRL, "KEY_LEFT"), color=COLORS["navigate"], treshold=20)
+    pan.macro_center = [keys(CTRL, "KEY_8", title="Look at the selection")]
+    return pan
+
+
+def _solidcraft_undo() -> Segment:
+    return _app_turn("Undo / Redo", ("Redo", "edit.redo", CTRL, "KEY_Y"), ("Undo", "edit.undo", CTRL, "KEY_Z"),
+                     color=COLORS["history"], treshold=45)
+
+
+def _solidcraft_search() -> Segment:
+    return _app_tap("Command search", ("Command search", "turnpad.search", "KEY_S"),
+                    color=COLORS["zoom"], icon="edit-find-symbolic")
+
+
+def solidcraft_profile_segments() -> list[Segment]:
+    return [_solidcraft_orbit(), _solidcraft_tilt(), _solidcraft_zoom(), _solidcraft_pan(),
+            _solidcraft_undo(), _solidcraft_search()]
 
 
 # KiCad 9 (common/tool/actions.cpp, pcbnew/tools/pcb_actions.cpp, Linux
@@ -833,6 +908,66 @@ def freecad_advanced_segments() -> list[Segment]:
         sketch,
         constrain,
         basic[3],  # Undo / Redo
+    ]
+
+
+# SolidCraft, advanced: the view, the standard views, then the stages of a
+# part: sketch, model, check. Taps of tools open SolidCraft's own tool or
+# dialog, as its toolbar does.
+def solidcraft_advanced_segments() -> list[Segment]:
+    view = _group("View", [
+        _look(_solidcraft_orbit(), VIEW),
+        _look(_solidcraft_tilt(), VIEW),
+        _look(_app_turn("Roll", ("Roll clockwise", "turnpad.roll_cw"), ("Roll counterclockwise", "turnpad.roll_ccw"),
+                        ("Home view", "turnpad.view_home"), color=COLORS["navigate"], treshold=20), VIEW),
+        _look(_solidcraft_pan(), VIEW),
+        _look(_app_turn("Pan up / down", ("Pan down", "turnpad.pan_down", CTRL, "KEY_DOWN"),
+                        ("Pan up", "turnpad.pan_up", CTRL, "KEY_UP"), color=COLORS["navigate"], treshold=20), VIEW),
+    ], icon="camera-video-symbolic")
+    views = _group("Views", [
+        _app_tap("Fit", ("Fit", "turnpad.view_fit", "KEY_F6"), color=COLORS["zoom"], icon="view-reveal-symbolic"),
+        _app_tap("Home view", ("Home view", "turnpad.view_home"), color=COLORS["navigate"], icon="go-next-symbolic"),
+        _app_tap("Isometric", ("Isometric view", "turnpad.view_iso"), color=COLORS["navigate"], icon="view-reveal-symbolic"),
+        _app_tap("Front", ("Front view", "turnpad.view_front"), color=COLORS["navigate"], icon="view-reveal-symbolic"),
+        _app_tap("Top", ("Top view", "turnpad.view_top"), color=COLORS["navigate"], icon="go-up-symbolic"),
+        _app_tap("Right", ("Right view", "turnpad.view_right"), color=COLORS["navigate"], icon="go-next-symbolic"),
+    ], icon="view-reveal-symbolic")
+    sketch = _group("Sketch", [
+        _app_tap("Create sketch", ("Create sketch", "sketch.create"), color=COLORS["brush"], icon="document-edit-symbolic"),
+        _app_tap("Line", ("Line", "sketch.line", "KEY_L"), color=COLORS["brush"], icon="document-edit-symbolic"),
+        _app_tap("Rectangle", ("2-point rectangle", "sketch.rectangle.two_point", "KEY_R"),
+                 color=COLORS["brush"], icon="document-edit-symbolic"),
+        _app_tap("Circle", ("Center diameter circle", "sketch.circle.center", "KEY_C"),
+                 color=COLORS["brush"], icon="document-edit-symbolic"),
+        _app_tap("Dimension", ("Sketch dimension", "sketch.dimension", "KEY_D"), color=COLORS["light"], icon="starred-symbolic"),
+        _app_tap("Trim", ("Trim", "sketch.trim", "KEY_T"), color=COLORS["cut"], icon="edit-cut-symbolic"),
+        _app_tap("Finish sketch", ("Finish sketch", "sketch.finish"), color=COLORS["layers"], icon="go-next-symbolic"),
+    ], icon="document-edit-symbolic")
+    model = _group("Model", [
+        _app_tap("Extrude", ("Extrude", "solid.extrude", "KEY_E"), color=COLORS["layers"], icon="go-up-symbolic"),
+        _app_tap("Revolve", ("Revolve", "solid.revolve"), color=COLORS["layers"], icon="view-refresh-symbolic"),
+        _app_tap("Fillet", ("Fillet", "solid.fillet", "KEY_F"), color=COLORS["brush"], icon="document-edit-symbolic"),
+        _app_tap("Chamfer", ("Chamfer", "solid.chamfer"), color=COLORS["brush"], icon="document-edit-symbolic"),
+        _app_tap("Hole", ("Hole", "solid.hole", "KEY_H"), color=COLORS["cut"], icon="edit-cut-symbolic"),
+        _app_tap("Shell", ("Shell", "solid.shell"), color=COLORS["cut"], icon="edit-cut-symbolic"),
+        _app_tap("Press pull", ("Press pull", "solid.press_pull", "KEY_Q"), color=COLORS["layers"], icon="go-up-symbolic"),
+    ], icon="go-up-symbolic")
+    check = _group("Inspect", [
+        _app_tap("Measure", ("Measure", "inspect.measure", "KEY_I"), color=COLORS["light"], icon="starred-symbolic"),
+        _app_tap("Section", ("Section analysis", "inspect.section"), color=COLORS["light"], icon="view-reveal-symbolic"),
+        _app_tap("Parameters", ("Change parameters", "parameters.change"), color=COLORS["history"],
+                 icon="preferences-system-symbolic"),
+        _app_tap("Appearance", ("Appearance", "appearance.assign", "KEY_A"), color=COLORS["brush"], icon="starred-symbolic"),
+    ], icon="starred-symbolic")
+    return [
+        view,
+        _look(_solidcraft_zoom(), VIEW),
+        views,
+        sketch,
+        model,
+        check,
+        _solidcraft_undo(),
+        _solidcraft_search(),
     ]
 
 
@@ -1270,6 +1405,40 @@ def freecad_spacemouse_buttons() -> dict[str, SpaceMouseButton]:
     return buttons
 
 
+def _app_press(label: str, command: str, *names: str) -> SpaceMouseButton:
+    """A button that runs an application command (the keys without its link)."""
+    return SpaceMouseButton(press=SpaceMouseAction("app", command=command, keys=list(names) or None), label=label)
+
+
+# SolidCraft reads the cap (spacenavd or hidraw) but no button
+# (apps/solidcraft/src/space_mouse/spacenavd.rs skips button records), so
+# every key is free: the view keys run the bridge's views (90-degree rolls as
+# the navigation cube's arrows), the function keys its tools (see the dial
+# pack above for the keys pressed without the bridge).
+def solidcraft_spacemouse_buttons() -> dict[str, SpaceMouseButton]:
+    buttons = {
+        "1": _app_press("Fit", "turnpad.view_fit", "KEY_F6"),
+        "2": _app_press("Top", "turnpad.view_top"),
+        "6": _app_press("Bottom", "turnpad.view_bottom"),
+        "4": _app_press("Right", "turnpad.view_right"),
+        "3": _app_press("Left", "turnpad.view_left"),
+        "5": _app_press("Front", "turnpad.view_front"),
+        "7": _app_press("Back", "turnpad.view_back"),
+        "8": _app_press("Roll 90° right", "turnpad.roll_quarter_cw"),
+        "9": _app_press("Roll 90° left", "turnpad.roll_quarter_ccw"),
+        "10": _app_press("Isometric", "turnpad.view_iso"),
+        "11": _app_press("Home view", "turnpad.view_home"),
+    }
+    buttons.update(_function_keys(
+        (_app_press("Extrude", "solid.extrude", "KEY_E"), _app_press("Revolve", "solid.revolve")),
+        (_app_press("Fillet", "solid.fillet", "KEY_F"), _app_press("Chamfer", "solid.chamfer")),
+        (_app_press("Hole", "solid.hole", "KEY_H"), _app_press("Shell", "solid.shell")),
+        (_app_press("Create sketch", "sketch.create"), _app_press("Finish sketch", "sketch.finish")),
+        (_app_press("Measure", "inspect.measure", "KEY_I"), _app_press("Search", "turnpad.search", "KEY_S")),
+    ))
+    return buttons
+
+
 # Krita 5 (krita/data/shortcuts/krita_default.shortcuts): Ctrl+0 zoom 100 %,
 # Tab canvas only, Ctrl+= / Ctrl+- zoom, Ctrl+] / Ctrl+[ rotate the canvas,
 # M / Alt+M mirror. Krita has no default for fit and none for a reset rotation.
@@ -1426,6 +1595,9 @@ APP_PACKS: tuple[AppPack, ...] = (
     AppPack("FreeCAD", ("freecad",), freecad_profile_segments, "org.freecad.FreeCAD.desktop", "3D",
             "Keys reach the 3D view or the sketch only while it has the focus",
             advanced=freecad_advanced_segments, spacemouse=freecad_spacemouse_buttons),
+    AppPack("SolidCraft", ("solidcraft",), solidcraft_profile_segments, "ai.storyteller.solidcraft.desktop", "3D",
+            "Runs SolidCraft's commands when it has a control port (SOLIDCRAFT.md), its keys otherwise",
+            advanced=solidcraft_advanced_segments, spacemouse=solidcraft_spacemouse_buttons),
     AppPack("KiCad", ("kicad", "pcbnew", "eeschema"), kicad_profile_segments, "org.kicad.pcbnew.desktop",
             "Electronics", "For the PCB editor; the schematic editor shares zoom, grid, move and rotate "
             "(add a profile for it too)",

@@ -60,9 +60,14 @@ TYPELIBS = {
 def shipped_modules():
     """Python files install.sh copies to the program directory."""
     files = list(ROOT.glob("*.py"))
-    for package in ("config", "config_app", "desktop", "overlay", "layouts", "screen"):
+    for package in ("config", "config_app", "desktop", "overlay", "layouts", "screen", *BRIDGE_PACKAGES):
         files += (ROOT / package).glob("*.py")
     return files
+
+
+# The bridge host and the bridges the driver runs (integrations/bridges.py);
+# the Blender add-on runs inside Blender and is not imported here.
+BRIDGE_PACKAGES = ("integrations", "integrations/applink", "integrations/solidcraft")
 
 
 def package_groups():
@@ -119,6 +124,11 @@ class InstallTest(unittest.TestCase):
         # The Blender add-on, py and toml, in the installer and the packages.
         self.assertIn("integrations/blender/turnpad/*.py integrations/blender/turnpad/*.toml", installer)
         self.assertIn("integrations/blender/turnpad/*.py integrations/blender/turnpad/*.toml", packaged)
+        # The bridges, every module of each package.
+        for package in BRIDGE_PACKAGES:
+            with self.subTest(package=package):
+                self.assertIn(f"{package}/*.py", installer)
+                self.assertRegex(packaged, rf"for dir in [^;]*\b{re.escape(package)}( |;)")
         for name in ("laptop_touchpad_dialpad_layouts.csv", "config_app/icon.svg", "config_app/style.css"):
             with self.subTest(file=name):
                 self.assertIn(name, installer)
@@ -262,7 +272,8 @@ class DistributionPackagesTest(unittest.TestCase):
                     self.assertIn((manager, group), groups)
 
     def test_every_imported_library_has_a_package(self):
-        local = {path.stem for path in ROOT.glob("*.py")} | {"config", "config_app", "desktop", "overlay", "layouts", "screen"}
+        local = {path.stem for path in ROOT.glob("*.py")} | {"config", "config_app", "desktop", "overlay", "layouts", "screen",
+                                                             "integrations"}
         imported = {}
         for path in shipped_modules():
             for node in ast.walk(ast.parse(path.read_text())):

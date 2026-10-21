@@ -108,6 +108,7 @@ from config_app.commandline import resolve_app
 from config_app.context_dialogs import contexts_group
 from config_app.device_dialogs import MousePicker, SetupAssistant
 from config_app.outline_editor import PRESETS, OutlineEditor
+from config_app.plugins_ui import PluginsPage
 from config_app.recorder_dialog import MacroRecorderDialog
 from config_app.spacemouse_ui import SpaceMouseExtras
 from desktop.color_scheme import ColorScheme
@@ -398,7 +399,7 @@ class _ScreenPicture(Gtk.Widget):
         Gtk.Widget.do_dispose(self)
 
 
-class Application(SpaceMouseExtras, Adw.Application):
+class Application(SpaceMouseExtras, PluginsPage, Adw.Application):
     # (name, title, icon, builder) of the pages in the sidebar's order.
     PAGES = (
         ("actions", "Dial Controls", "input-dialpad-symbolic", "_build_actions_page"),
@@ -408,6 +409,7 @@ class Application(SpaceMouseExtras, Adw.Application):
         ("calibration", "Calibration", "find-location-symbolic", "_build_calibration_page"),
         ("spacemouse", "SpaceMouse", "input-gaming-symbolic", "_build_spacemouse_page"),
         ("screen", "Screen", "video-display-symbolic", "_build_screen_page"),
+        ("plugins", "Plugins", "application-x-addon-symbolic", "_build_plugins_page"),
         ("diagnostics", "Driver", "utilities-terminal-symbolic", "_build_diagnostics_page"),
     )
 
@@ -463,6 +465,7 @@ class Application(SpaceMouseExtras, Adw.Application):
         self._sm_status_row = None
         self._sm_restart_source = 0
         self._init_spacemouse_extras()
+        self._init_plugins_page()
         # Screen page: the profile edited (None = all applications), the
         # SpaceMouse screens found, the preview and the containers that are
         # filled again when something they show changes.
@@ -794,6 +797,8 @@ class Application(SpaceMouseExtras, Adw.Application):
             self._rebuild_actions_page()
         elif name in ("diagnostics", "spacemouse"):
             self._refresh_diagnostics()
+        elif name == "plugins":
+            self._refresh_plugins_page()
         elif name == "screen":
             self._adopt_screen_from_disk()
             self._refresh_screen_presence()

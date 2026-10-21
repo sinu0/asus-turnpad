@@ -38,7 +38,7 @@ SIZES = {
     "1080p": (1920, 1048),
     "4K": (3840, 2128),
 }
-PAGES = ("actions", "profiles", "look", "device", "calibration", "spacemouse", "screen", "diagnostics")
+PAGES = ("actions", "profiles", "look", "device", "calibration", "spacemouse", "screen", "plugins", "diagnostics")
 CALIBRATION_RESULT = {"circle_diameter": 1012, "center_button_diameter": 388, "center_x": 3341, "center_y": 640}
 # Long enough for a resize or a new page to be laid out and mapped.
 SETTLE_MS = 120
